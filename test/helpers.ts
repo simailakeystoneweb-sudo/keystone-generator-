@@ -17,6 +17,15 @@ export function testConfig(over: Partial<Config["rules"]> = {}): Config {
   cfg.googlePlacesApiKey = "test-key";
   cfg.hunterApiKey = "";
   cfg.dashboardToken = "";
+  cfg.emailFrom = '"Keystone Web Agency" <hello@keystone.test>';
+  cfg.outreachFromEmail = "hello@keystone.test";
+  cfg.twilioPhoneNumber = "+15125550000";
+  cfg.twilioAuthToken = "test-twilio-token";
+  cfg.twilioValidateSignature = true;
+  cfg.resendWebhookSecret = "whsec_" + Buffer.from("test-resend-secret").toString("base64");
+  cfg.smsQuietHoursStart = 21;
+  cfg.smsQuietHoursEnd = 8;
+  cfg.sendRateLimitPerMinute = 1000;
   cfg.rules = {
     ...cfg.rules,
     approvalMode: "auto",

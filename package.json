@@ -12,7 +12,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node -e \"for (const f of ['dashboard.html','lead.html']) require('fs').copyFileSync('src/web/'+f,'dist/web/'+f)\"",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "dev": "node --no-warnings=ExperimentalWarning --import tsx src/cli.ts",
     "serve": "node --no-warnings=ExperimentalWarning --import tsx src/cli.ts serve",
     "test": "node --no-warnings=ExperimentalWarning --import tsx --test test/*.test.ts",
@@ -22,6 +22,8 @@
     "@anthropic-ai/sdk": "^0.131.0",
     "express": "^5.2.1",
     "nodemailer": "^10.0.15",
+    "resend": "^6.32.1",
+    "twilio": "^6.1.2",
     "zod": "^4.6.5"
   },
   "devDependencies": {

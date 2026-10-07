@@ -8,7 +8,9 @@ import { testConfig } from "./helpers.js";
 const lead = (over: Partial<Lead> = {}): Lead => ({
   id: 1, businessName: "Joe's", contactName: "Joe", email: "joe@joes.com", phone: "+15125550100", website: "joes.com",
   industry: "Plumber", city: "Austin", address: null, source: "csv", sourceId: null, rating: 4.5, reviewCount: 30,
-  audit: null, score: 80, status: "drafted", smsConsent: false, optedOut: false, notes: null, createdAt: "", updatedAt: "",
+  audit: null, analysis: null, description: null, score: 80, status: "drafted", smsConsent: false,
+  emailOptOut: false, smsOptOut: false, doNotContact: false, emailStatus: null, smsStatus: null, lastContactedAt: null,
+  replied: false, sequencePaused: false, lastReplyClassification: null, notes: null, createdAt: "", updatedAt: "",
   ...over,
 });
 const none = () => false;
@@ -26,8 +28,10 @@ test("approval: manual mode always queues; blocks always skip", () => {
   assert.equal(decideApproval(lead(), r, none).action, "needs_approval");
   assert.equal(decideApproval(lead({ industry: "Cannabis Dispensary" }), r, none).action, "skip");
   assert.equal(decideApproval(lead({ email: "x@city.gov" }), r, none).action, "skip");
-  assert.equal(decideApproval(lead({ optedOut: true }), r, none).action, "skip");
-  assert.equal(decideApproval(lead(), r, (v) => v === "joe@joes.com").action, "skip");
+  assert.equal(decideApproval(lead({ doNotContact: true }), r, none).action, "skip");
+  assert.equal(decideApproval(lead({ emailOptOut: true, smsOptOut: true }), r, none).action, "skip");
+  assert.equal(decideApproval(lead({ emailOptOut: true }), r, none).action, "needs_approval", "SMS still possible, but needs review");
+  assert.equal(decideApproval(lead(), r, (v) => v === "joe@joes.com" || v === "+15125550100").action, "skip");
 });
 
 test("send window respects timezone and weekends", () => {

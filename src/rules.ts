@@ -14,9 +14,10 @@ export type Decision =
  */
 export function decideApproval(lead: Lead, rules: RulesConfig, isSuppressed: (v: string | null) => boolean): Decision {
   const block: string[] = [];
-  if (lead.optedOut) block.push("lead opted out");
-  if (isSuppressed(lead.email) || isSuppressed(lead.phone)) block.push("on suppression list");
-  if (!lead.email && !lead.phone) block.push("no email or phone");
+  const emailOk = Boolean(lead.email) && !lead.emailOptOut && !isSuppressed(lead.email);
+  const smsOk = Boolean(lead.phone) && !lead.smsOptOut && !isSuppressed(lead.phone);
+  if (lead.doNotContact) block.push("lead is marked do not contact");
+  else if (!emailOk && !smsOk) block.push("no contactable channel (missing, opted out or suppressed)");
   const host = lead.email?.split("@")[1]?.toLowerCase() ?? (lead.website ? hostOf(lead.website) : null);
   if (host && rules.blockedDomains.some((d) => host === d || host.endsWith(`.${d}`))) block.push(`blocked domain ${host}`);
   const ind = (lead.industry ?? "").toLowerCase();
@@ -28,7 +29,7 @@ export function decideApproval(lead: Lead, rules: RulesConfig, isSuppressed: (v:
 
   const why: string[] = [];
   if ((lead.score ?? 0) < rules.autoApproveMinScore) why.push(`score ${lead.score} < auto-approve ${rules.autoApproveMinScore}`);
-  if (!lead.email) why.push("no email (SMS-only leads always need review)");
+  if (!emailOk) why.push("no usable email (SMS-only leads always need review)");
   if (why.length) return { action: "needs_approval", reasons: why };
   return { action: "auto_approve", reasons: [`score ${lead.score} ≥ ${rules.autoApproveMinScore}`] };
 }
@@ -65,23 +66,29 @@ export interface SendCheckContext {
   repliedOrBeyond: boolean;
 }
 
+/** Whether the email channel is usable for this lead (so SMS shouldn't wait for an email that will never go out). */
+const emailUsable = (lead: Lead, isSuppressed: (v: string | null) => boolean) => Boolean(lead.email) && !lead.emailOptOut && !lead.doNotContact && !isSuppressed(lead.email);
+
 /** Automation rules evaluated at send time, per channel. Returns null if OK, else why not. */
 export function sendBlocker(channel: Channel, lead: Lead, rules: RulesConfig, ctx: SendCheckContext): string | null {
-  if (lead.optedOut) return "opted out";
-  if (ctx.repliedOrBeyond) return "lead already replied";
+  if (lead.doNotContact) return "do not contact";
+  if (lead.replied || ctx.repliedOrBeyond) return "lead already replied";
+  if (lead.sequencePaused) return "sequence paused";
   if (ctx.alreadySent[channel]) return `${channel} already sent`;
   if (!inSendWindow(ctx.now, rules)) return "outside send window";
   if (channel === "email") {
     if (!lead.email) return "no email";
+    if (lead.emailOptOut) return "opted out of email";
     if (ctx.isSuppressed(lead.email)) return "email suppressed";
     if (ctx.sentToday.email >= rules.dailyEmailLimit) return "daily email limit reached";
     return null;
   }
   if (!lead.phone) return "no phone";
+  if (lead.smsOptOut) return "opted out of SMS";
   if (ctx.isSuppressed(lead.phone)) return "phone suppressed";
   if (rules.smsRequireConsent && !lead.smsConsent) return "no SMS consent on record (TCPA)";
   if (ctx.sentToday.sms >= rules.dailySmsLimit) return "daily SMS limit reached";
-  if (lead.email && rules.smsDelayDays > 0) {
+  if (emailUsable(lead, ctx.isSuppressed) && rules.smsDelayDays > 0) {
     if (!ctx.firstEmailAt) return "waiting for email to go out first";
     const due = ctx.firstEmailAt.getTime() + rules.smsDelayDays * 86_400_000;
     if (ctx.now.getTime() < due) return `SMS follow-up scheduled after ${new Date(due).toISOString()}`;

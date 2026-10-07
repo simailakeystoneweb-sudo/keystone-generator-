@@ -46,7 +46,24 @@
   .msg { border-top:1px solid var(--line); padding:8px 0; font-size:13px; } .msg:first-child { border-top:0; }
   pre { white-space:pre-wrap; margin:0; font:inherit; }
   .timeline div { font-size:12px; padding:2px 0; }
-  #toast { position:fixed; bottom:16px; right:16px; background:var(--ink); color:var(--bg); padding:8px 12px; border-radius:8px; display:none; max-width:calc(100% - 32px); }
+  #toast { position:fixed; bottom:16px; right:16px; background:var(--ink); color:var(--bg); padding:10px 14px; border-radius:8px; display:none; max-width:calc(100% - 32px); z-index:10; box-shadow:0 4px 16px rgba(0,0,0,.2); }
+  #toast.success { background:var(--ok); color:#fff; } #toast.error { background:var(--bad); color:#fff; }
+  .prefs { display:grid; gap:6px; margin-top:6px; }
+  .prefs label { display:flex; gap:8px; align-items:center; margin:0; font-size:13px; color:var(--ink); }
+  .prefs input { width:auto; }
+  .flag { color:var(--bad); font-weight:600; }
+  dialog#sendModal { width:min(640px, calc(100% - 32px)); max-height:calc(100% - 32px); border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--ink); padding:0; }
+  dialog#sendModal::backdrop { background:rgba(0,0,0,.45); }
+  .modal-head { padding:14px 16px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:8px; }
+  .modal-body { padding:14px 16px; display:grid; gap:10px; overflow:auto; }
+  .modal-foot { padding:12px 16px; border-top:1px solid var(--line); display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap; }
+  .field-label { font-size:12px; color:var(--muted); margin-bottom:2px; }
+  .field-value { overflow-wrap:anywhere; }
+  .preview { border:1px solid var(--line); border-radius:8px; padding:10px; background:var(--bg); max-height:300px; overflow:auto; white-space:pre-wrap; }
+  .preview .auto { color:var(--muted); }
+  .banner { border-radius:8px; padding:8px 10px; font-size:13px; }
+  .banner.warn { background:color-mix(in srgb, var(--warn) 15%, transparent); border:1px solid var(--warn); }
+  .banner.bad { background:color-mix(in srgb, var(--bad) 12%, transparent); border:1px solid var(--bad); }
 </style>
 </head>
 <body>
@@ -64,6 +81,20 @@
     <section class="card">
       <h2>Lead</h2>
       <dl id="info"></dl>
+      <h3>Contact preferences</h3>
+      <div class="prefs" id="prefs">
+        <label><input type="checkbox" data-pref="emailOptOut"> Email opt-out</label>
+        <label><input type="checkbox" data-pref="smsOptOut"> SMS opt-out</label>
+        <label><input type="checkbox" data-pref="doNotContact"> Do not contact</label>
+        <label><input type="checkbox" data-pref="smsConsent"> SMS consent recorded</label>
+        <label><input type="checkbox" data-pref="sequencePaused"> Sequence paused</label>
+      </div>
+      <p class="small muted">Opt-outs from replies, STOP texts and unsubscribe links are permanent; only a change here re-enables a channel.</p>
+    </section>
+
+    <section class="card" id="lastReplyCard" hidden>
+      <h2>Last reply</h2>
+      <div id="lastReply"></div>
     </section>
 
     <section class="card">
@@ -92,7 +123,7 @@
     </section>
 
     <section class="card">
-      <h2>Messages</h2>
+      <h2>Communications</h2>
       <div id="messages"></div>
       <h3>Timeline</h3>
       <div id="timeline" class="timeline"></div>
@@ -106,7 +137,7 @@
         <button id="btnEmail" data-label="Generate Email" data-busy="Writing email…"><span class="spinner"></span><span>Generate Email</span></button>
         <button id="btnSms" data-label="Generate SMS" data-busy="Writing SMS…"><span class="spinner"></span><span>Generate SMS</span></button>
       </div>
-      <p class="notice" style="margin:10px 0 0">Nothing is sent from this page. Generated copy is saved as an <b>unapproved draft</b> for you to review and edit.</p>
+      <p class="notice" style="margin:10px 0 0">AI buttons never send anything — generated copy is saved as an <b>unapproved draft</b>. Messages only go out when you confirm <b>Send Email</b> or <b>Send Text</b>.</p>
       <div id="aiError" class="error" hidden></div>
     </section>
 
@@ -125,6 +156,7 @@
         <div class="counter" id="emailCount"></div>
       </div>
       <div class="actions" style="margin-top:8px">
+        <button class="primary" id="btnSendEmail">Send Email…</button>
         <button data-save="email">Save edits</button>
         <button data-copy="email">Copy</button>
       </div>
@@ -138,6 +170,7 @@
       </div>
       <p class="small muted">"Reply STOP to opt out." is added automatically when sent.</p>
       <div class="actions">
+        <button class="primary" id="btnSendSms">Send Text…</button>
         <button data-save="sms">Save edits</button>
         <button data-copy="sms">Copy</button>
       </div>
@@ -163,7 +196,15 @@
     </section>
   </div>
 </main>
-<div id="toast"></div>
+<dialog id="sendModal" aria-labelledby="sendTitle">
+  <div class="modal-head"><h2 id="sendTitle" style="margin:0">Send</h2><span id="sendProvider" class="pill"></span></div>
+  <div class="modal-body" id="sendBody"></div>
+  <div class="modal-foot">
+    <button id="sendCancel" type="button">Cancel</button>
+    <button id="sendConfirm" type="button" class="primary" data-label="Send" data-busy="Sending…"><span class="spinner"></span><span>Send</span></button>
+  </div>
+</dialog>
+<div id="toast" role="status" aria-live="polite"></div>
 
 <script>
 const $ = (s) => document.querySelector(s);
@@ -188,7 +229,10 @@ async function api(path, opts = {}) {
   return data;
 }
 const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body || {}) });
-function toast(msg) { const t = $("#toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 3000); }
+function toast(msg, kind = "") {
+  const t = $("#toast"); t.textContent = msg; t.className = kind; t.style.display = "block";
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", kind === "error" ? 6000 : 3500);
+}
 
 /** Run an async action with the button in a loading state; returns the result or null on error. */
 async function withLoading(btn, fn, opts = {}) {
@@ -222,7 +266,20 @@ function renderInfo() {
     row("Website", l.website ? `<a href="${esc(/^https?:/i.test(l.website) ? l.website : "https://" + l.website)}" target="_blank" rel="noopener noreferrer">${esc(l.website)}</a>` : "") +
     row("Industry", esc(l.industry)) + row("City", esc(l.city)) + row("Address", esc(l.address)) +
     row("Rating", l.rating ? `${l.rating} ★ (${l.reviewCount ?? 0})` : "") + row("Fit score", l.score ?? "") +
-    row("SMS consent", l.smsConsent ? "Yes" : "No");
+    row("Email status", esc(l.emailStatus) + (l.emailOptOut ? ' <span class="flag">opted out</span>' : "")) +
+    row("SMS status", esc(l.smsStatus) + (l.smsOptOut ? ' <span class="flag">opted out</span>' : "")) +
+    row("Last contacted", l.lastContactedAt ? esc(new Date(l.lastContactedAt).toLocaleString()) : "") +
+    row("Replied", l.replied ? "Yes" : "No") +
+    row("Sequence", l.sequencePaused ? "Paused" : "Active") +
+    (l.doNotContact ? row("Do not contact", '<span class="flag">Yes</span>') : "");
+  document.querySelectorAll("[data-pref]").forEach((el) => { el.checked = Boolean(l[el.dataset.pref]); });
+  const r = l.lastReplyClassification;
+  $("#lastReplyCard").hidden = !r;
+  if (r) $("#lastReply").innerHTML = `<dl>
+    <dt>Classification</dt><dd><span class="pill">${esc(r.classification)}</span> <span class="small muted">${esc(r.source)}</span></dd>
+    <dt>Sentiment</dt><dd>${esc(r.sentiment)}</dd>
+    <dt>Next step</dt><dd>${esc(r.recommendedAction)}</dd>
+    <dt>When</dt><dd>${esc(new Date(r.classifiedAt).toLocaleString())}</dd></dl>`;
 }
 
 function renderAudit() {
@@ -247,9 +304,13 @@ function renderAnalysis(a) {
 }
 
 function renderMessages() {
-  $("#messages").innerHTML = lead.messages.length
-    ? lead.messages.map((m) => `<div class="msg"><span class="pill">${m.direction} ${m.channel}</span> <span class="pill">${esc(m.status)}</span> <span class="small muted">${esc(new Date(m.createdAt).toLocaleString())}</span>
-        ${m.subject ? `<div><b>${esc(m.subject)}</b></div>` : ""}<pre>${esc(m.body.slice(0, 600))}</pre></div>`).join("")
+  const list = lead.communications || [];
+  $("#messages").innerHTML = list.length
+    ? list.slice().reverse().map((m) => `<div class="msg"><span class="pill">${esc(m.direction)} ${esc(m.channel)}</span> <span class="pill">${esc(m.provider)}</span> <span class="pill">${esc(m.status)}</span>
+        <span class="small muted">${esc(new Date(m.sentAt || m.createdAt).toLocaleString())}</span>
+        ${m.classification ? ` <span class="pill">${esc(m.classification.classification)}</span>` : ""}
+        ${m.subject ? `<div><b>${esc(m.subject)}</b></div>` : ""}<pre>${esc(m.body.slice(0, 600))}</pre>
+        ${m.error ? `<div class="error">${esc(m.error)}</div>` : ""}</div>`).join("")
     : `<p class="muted small">No messages yet.</p>`;
   $("#timeline").innerHTML = lead.events.slice().reverse().map((e) =>
     `<div><span class="muted">${esc(new Date(e.createdAt).toLocaleString())}</span> <b>${esc(e.type)}</b> ${esc(e.detail || "")}</div>`).join("");
@@ -354,6 +415,95 @@ document.addEventListener("click", async (e) => {
     toast("Saved");
   } catch (err) { toast("Error: " + err.message); }
 });
+// ---------- confirmation modal (Send Email / Send Text) ----------
+
+const modal = $("#sendModal");
+let pending = null; // { kind, payload } — exactly what will be posted
+let sending = false;
+
+const newKey = () => (crypto.randomUUID ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join(""));
+const field = (label, html) => `<div><div class="field-label">${label}</div><div class="field-value">${html}</div></div>`;
+
+async function openSend(kind) {
+  const subject = $("#emailSubject").value.trim(), body = $("#emailBody").value.trim(), message = $("#smsBody").value.trim();
+  if (kind === "email" && (!subject || !body)) return toast("Write or generate the email subject and body first.", "error");
+  if (kind === "sms" && !message) return toast("Write or generate the text message first.", "error");
+  let preview;
+  try { preview = (await api(`/leads/${leadId}/send-preview`))[kind]; }
+  catch (e) { return toast("Error: " + e.message, "error"); }
+
+  const confirm = $("#sendConfirm");
+  const label = kind === "email" ? "Send Email" : "Send Text";
+  confirm.dataset.label = label; confirm.querySelector("span:last-child").textContent = label;
+  $("#sendTitle").textContent = kind === "email" ? "Send email?" : "Send text message?";
+  $("#sendProvider").textContent = preview.dryRun ? "DRY RUN" : (preview.provider || "not configured");
+
+  const banners =
+    (preview.ok ? "" : `<div class="banner bad"><b>Can't send:</b> ${esc(preview.message)}</div>`) +
+    (preview.dryRun ? `<div class="banner warn">DRY_RUN is on: this will be logged and recorded, but not delivered.</div>` : "");
+  if (kind === "email") {
+    const to = lead.contactName ? `${esc(lead.contactName)} &lt;${esc(preview.to)}&gt;` : esc(preview.to || "—");
+    $("#sendBody").innerHTML = banners +
+      field("Recipient", to) +
+      field("From", esc(preview.from || "—")) +
+      field("Subject", esc(subject)) +
+      field("Email body", `<div class="preview">${esc(body)}\n\n<span class="auto">${esc(preview.footer)}</span></div><div class="small muted">The grey footer (address + unsubscribe link) is added automatically.</div>`);
+    pending = { kind, payload: { email: preview.to, subject, body, idempotencyKey: newKey() } };
+  } else {
+    const full = `${message} ${preview.optOutText}`;
+    $("#sendBody").innerHTML = banners +
+      field("Phone number", esc(preview.to || "—")) +
+      field("Message", `<div class="preview">${esc(message)} <span class="auto">${esc(preview.optOutText)}</span></div><div class="small muted">${full.length} characters · ${full.length <= 160 ? 1 : Math.ceil(full.length / 153)} SMS segment(s). The opt-out line is added automatically.</div>`);
+    pending = { kind, payload: { phone: preview.to, message, idempotencyKey: newKey() } };
+  }
+  confirm.disabled = !preview.ok;
+  modal.showModal();
+  $("#sendCancel").focus(); // safe default: Enter/Space cancels
+}
+
+function closeSend() { if (!sending) { modal.close(); pending = null; } }
+$("#sendCancel").onclick = closeSend;
+modal.addEventListener("cancel", (e) => { if (sending) e.preventDefault(); else pending = null; }); // Esc
+modal.addEventListener("click", (e) => { if (e.target === modal) closeSend(); }); // backdrop
+
+$("#sendConfirm").onclick = async (e) => {
+  if (!pending || sending) return;
+  const btn = e.currentTarget, labelEl = btn.querySelector("span:last-child"), label = btn.dataset.label;
+  sending = true; btn.disabled = true; $("#sendCancel").disabled = true; btn.classList.add("loading"); labelEl.textContent = btn.dataset.busy;
+  const { kind, payload } = pending;
+  try {
+    const r = await post(`/leads/${leadId}/${kind}/send`, payload);
+    sending = false; modal.close(); pending = null;
+    const what = kind === "email" ? "Email" : "Text";
+    toast(r.dryRun ? `Dry run: ${what.toLowerCase()} recorded, not delivered.` : r.duplicate ? `${what} was already sent.` : `${what} sent to ${r.recipient}.`, "success");
+    await reloadSide();
+  } catch (err) {
+    toast("Send failed: " + err.message, "error");
+  } finally {
+    sending = false; btn.classList.remove("loading"); labelEl.textContent = label; btn.disabled = false; $("#sendCancel").disabled = false;
+  }
+};
+$("#btnSendEmail").onclick = () => openSend("email");
+$("#btnSendSms").onclick = () => openSend("sms");
+
+// ---------- contact preferences (manual change is the only way to clear an opt-out) ----------
+
+document.addEventListener("change", async (e) => {
+  const el = e.target.closest("[data-pref]");
+  if (!el) return;
+  const key = el.dataset.pref, value = el.checked;
+  const clearingOptOut = !value && ["emailOptOut", "smsOptOut", "doNotContact"].includes(key);
+  if (clearingOptOut && !confirm("This lead opted out. Only re-enable contact if they have explicitly asked to hear from you again. Continue?")) {
+    el.checked = true; return;
+  }
+  el.disabled = true;
+  try {
+    lead = { ...lead, ...(await api(`/leads/${leadId}/contact-preferences`, { method: "PATCH", body: JSON.stringify({ [key]: value }) })) };
+    await reloadSide(); toast("Contact preferences updated", "success");
+  } catch (err) { el.checked = !value; toast("Error: " + err.message, "error"); }
+  finally { el.disabled = false; }
+});
+
 $("#emailBody").addEventListener("input", counters);
 $("#smsBody").addEventListener("input", counters);
 

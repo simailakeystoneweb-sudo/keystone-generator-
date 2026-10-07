@@ -1,9 +1,10 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import nodemailer from "nodemailer";
 import type { Config } from "../config.js";
-import type { Fetch } from "../leads/finder.js";
+import type { CommProvider } from "../types.js";
 
 export interface EmailMessage {
+  from: string;
   to: string;
   subject: string;
   text: string;
@@ -11,16 +12,44 @@ export interface EmailMessage {
   unsubscribeUrl: string;
   /** Lead id echoed in tags/headers so webhooks can be matched even without provider ids. */
   leadId: number;
+  campaignId?: string | null;
+  /** Sent to providers that support it so a retried request can't send twice. */
+  idempotencyKey?: string;
 }
 
 export interface SendResult {
-  provider: string;
-  providerId: string | null;
+  provider: CommProvider;
+  providerMessageId: string | null;
 }
 
+/** A transport that delivers one email. Lead checks and CRM records live in sendLeadEmail. */
 export interface EmailSender {
-  readonly name: string;
+  readonly provider: CommProvider;
   send(msg: EmailMessage): Promise<SendResult>;
+}
+
+/** Raised by a sender when the provider rejects the email. `message` is safe to show to the user. */
+export class EmailProviderError extends Error {
+  constructor(message: string, readonly code: string | null = null, readonly status: number | null = null) {
+    super(message);
+    this.name = "EmailProviderError";
+  }
+}
+
+// ---------- unsubscribe links (HMAC-signed, no login needed) ----------
+
+export function unsubscribeToken(secret: string, leadId: number): string {
+  return createHmac("sha256", secret).update(`unsub:${leadId}`).digest("base64url").slice(0, 32);
+}
+
+export function unsubscribeUrl(cfg: Pick<Config, "publicBaseUrl" | "appSecret">, leadId: number): string {
+  return `${cfg.publicBaseUrl}/unsubscribe/${leadId}/${unsubscribeToken(cfg.appSecret, leadId)}`;
+}
+
+export function verifyUnsubscribeToken(secret: string, leadId: number, token: string): boolean {
+  const expected = Buffer.from(unsubscribeToken(secret, leadId));
+  const got = Buffer.from(token);
+  return got.length === expected.length && timingSafeEqual(got, expected);
 }
 
 /** Wrap the AI-written body with the legally required footer (CAN-SPAM: identity, address, opt-out). */
@@ -43,36 +72,8 @@ export function composeEmail(cfg: Config, body: string, unsubscribeUrl: string):
   return { text, html };
 }
 
-export class ResendSender implements EmailSender {
-  readonly name = "resend";
-  constructor(private cfg: Config, private fetchImpl: Fetch = fetch) {}
-
-  async send(msg: EmailMessage): Promise<SendResult> {
-    const res = await this.fetchImpl("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${this.cfg.resendApiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        from: this.cfg.emailFrom,
-        to: [msg.to],
-        reply_to: this.cfg.emailReplyTo || undefined,
-        subject: msg.subject,
-        text: msg.text,
-        html: msg.html,
-        headers: {
-          "List-Unsubscribe": `<${msg.unsubscribeUrl}>`,
-          "List-Unsubscribe-Post": "List-Unsubscribe=One-Click",
-        },
-        tags: [{ name: "lead_id", value: String(msg.leadId) }],
-      }),
-    });
-    const data = (await res.json().catch(() => ({}))) as { id?: string; message?: string };
-    if (!res.ok) throw new Error(`Resend ${res.status}: ${data.message ?? "send failed"}`);
-    return { provider: this.name, providerId: data.id ?? null };
-  }
-}
-
 export class GmailSender implements EmailSender {
-  readonly name = "gmail";
+  readonly provider = "GMAIL" as const;
   private transport;
   constructor(private cfg: Config) {
     // Gmail SMTP with an App Password (Google Account → Security → App passwords).
@@ -86,7 +87,7 @@ export class GmailSender implements EmailSender {
 
   async send(msg: EmailMessage): Promise<SendResult> {
     const info = await this.transport.sendMail({
-      from: this.cfg.emailFrom || this.cfg.gmailUser,
+      from: msg.from || this.cfg.gmailUser,
       to: msg.to,
       replyTo: this.cfg.emailReplyTo || undefined,
       subject: msg.subject,
@@ -95,31 +96,19 @@ export class GmailSender implements EmailSender {
       headers: { "X-Keystone-Lead": String(msg.leadId) },
       list: { unsubscribe: { url: msg.unsubscribeUrl, comment: "Unsubscribe" } },
     });
-    return { provider: this.name, providerId: info.messageId ?? null };
+    return { provider: this.provider, providerMessageId: info.messageId ?? null };
   }
 }
 
+/** DRY_RUN=true: logs instead of delivering. Records are stored with provider DRY_RUN. */
 export class DryRunEmailSender implements EmailSender {
-  readonly name = "dryrun-email";
+  readonly provider = "DRY_RUN" as const;
   readonly sent: EmailMessage[] = [];
   async send(msg: EmailMessage): Promise<SendResult> {
     this.sent.push(msg);
     console.log(`[dry-run] email → ${msg.to}: ${msg.subject}`);
-    return { provider: this.name, providerId: `dry-${Date.now()}-${this.sent.length}` };
+    return { provider: this.provider, providerMessageId: `dry-email-${Date.now()}-${this.sent.length}` };
   }
-}
-
-export function createEmailSender(cfg: Config): EmailSender | null {
-  if (cfg.dryRun) return new DryRunEmailSender();
-  if (cfg.emailProvider === "resend") {
-    if (!cfg.resendApiKey || !cfg.emailFrom) throw new Error("Resend needs RESEND_API_KEY and EMAIL_FROM");
-    return new ResendSender(cfg);
-  }
-  if (cfg.emailProvider === "gmail") {
-    if (!cfg.gmailUser || !cfg.gmailAppPassword) throw new Error("Gmail needs GMAIL_USER and GMAIL_APP_PASSWORD");
-    return new GmailSender(cfg);
-  }
-  return null;
 }
 
 /**

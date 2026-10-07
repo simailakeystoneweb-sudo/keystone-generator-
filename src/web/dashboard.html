@@ -25,7 +25,8 @@
   textarea { width:100%; min-height:90px; resize:vertical; }
   button { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:6px; padding:6px 10px; cursor:pointer; }
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.ok { color:var(--ok); border-color:var(--ok); } button.bad { color:var(--bad); border-color:var(--bad); }
+  button.ok { color:var(--ok); border-color:var(--ok); }
+  a.button-link { display:inline-block; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:6px; padding:6px 10px; text-decoration:none; } button.bad { color:var(--bad); border-color:var(--bad); }
   table { width:100%; border-collapse:collapse; } th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--muted); font-weight:500; font-size:12px; } tr.row { cursor:pointer; } tr.row:hover { background:var(--bg); }
   .scroll { overflow-x:auto; }
@@ -130,7 +131,7 @@ function queueItem(l) {
         <label class="small"><input type="checkbox" data-f="smsConsent" ${l.smsConsent ? "checked" : ""}> Lead has consented to SMS</label>
         <div class="small muted" style="margin-top:6px">Why: ${esc(d.reasoning)}</div>${findingsList(l)}</div>
     </div>
-    <div class="actions"><button class="ok" data-act="approve">Approve</button><button data-act="approve-send" class="primary">Approve &amp; send now</button>
+    <div class="actions"><button class="ok" data-act="approve">Approve</button><a class="button-link" href="/leads/${l.id}">Review &amp; send…</a>
       <button data-act="redraft">Redraft with AI</button><button class="bad" data-act="reject">Reject</button></div>
   </div>`;
 }
@@ -144,11 +145,10 @@ document.addEventListener("click", async (e) => {
   const id = box?.dataset.id;
   const a = t.dataset.act;
   if (!a || !id) return;
-  if (a === "approve" || a === "approve-send") {
+  if (a === "approve") {
     const edits = {};
     box.querySelectorAll("[data-f]").forEach((el) => edits[el.dataset.f] = el.type === "checkbox" ? el.checked : el.value);
-    await act(async () => { await post(`/leads/${id}/approve`, edits); if (a === "approve-send") return post(`/leads/${id}/send`); },
-      (r) => r ? `email: ${r.email ?? "sent"} · sms: ${r.sms ?? "sent"}` : "Approved");
+    await act(() => post(`/leads/${id}/approve`, edits), "Approved");
   }
   if (a === "reject") await act(() => post(`/leads/${id}/reject`, { reason: prompt("Reason?") || "rejected" }), "Rejected");
   if (a === "redraft") await act(() => post(`/leads/${id}/redraft`), "New draft ready");
@@ -161,7 +161,11 @@ $("#findForm").addEventListener("submit", (e) => {
 });
 // Finds, enriches and drafts only. Sending is always a separate, explicit "Send due" click.
 $("#runAll").onclick = () => act(() => post("/run", { send: false }), (r) => "Run (no sending): " + JSON.stringify(r));
-$("#sendDue").onclick = () => act(() => post("/send-due"), (r) => `Sent ${r.sent.length}, held ${r.held.length}`);
+// Bulk send of approved drafts under the automation rules — always asks first.
+$("#sendDue").onclick = () => {
+  if (!confirm("Send every approved email/text that is due now (respecting send window, daily limits, opt-outs and consent)?")) return;
+  act(() => post("/send-due"), (r) => `Sent ${r.sent.length}, held ${r.held.length}`);
+};
 refresh().catch((e) => toast(e.message));
 setInterval(() => refresh().catch(() => {}), 30000);
 </script>

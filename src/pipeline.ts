@@ -1,16 +1,20 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Config } from "./config.js";
-import { CRM } from "./crm/db.js";
+import { CRM, type ContactPreferencesPatch } from "./crm/db.js";
 import { auditWebsite, scoreLead } from "./leads/audit.js";
 import { findContact } from "./leads/enrich.js";
 import { searchGooglePlaces, type Fetch, type ImportedRow, type SearchQuery } from "./leads/finder.js";
-import { isOptOut, leadToInput, type Personalizer, type ReplyClassification } from "./ai/personalize.js";
+import { leadToInput, type Personalizer, type ReplyClassification } from "./ai/personalize.js";
 import type { AnalyzeLeadInput, ClaudeService, ColdEmail, ColdSms, FollowUp } from "./ai/claude.js";
-import { composeEmail, type EmailSender } from "./channels/email.js";
+import { composeEmail, unsubscribeUrl, verifyUnsubscribeToken, type EmailSender } from "./channels/email.js";
 import { composeSms, type SmsSender } from "./channels/sms.js";
 import { decideApproval, sendBlocker, startOfLocalDayIso } from "./rules.js";
-import type { Channel, Lead, LeadStatus, MessageStatus } from "./types.js";
-import { PIPELINE } from "./types.js";
+import { checkEmailContactable, sendLeadEmail, type SendLeadEmailInput, type SendOptions } from "./services/email/resend.js";
+import { checkSmsContactable, handleIncomingSms, sendLeadSMS, type IncomingSms, type SendLeadSmsInput } from "./services/sms/twilio.js";
+import { toE164 } from "./services/sms/phone.js";
+import { ProviderSendError, SendRejectedError, type Contactability } from "./services/errors.js";
+import { classifyAndApply, isOptOutPhrase, type ReplyClassifier } from "./services/replies.js";
+import type { Channel, Lead, LeadStatus, ReplyClassificationRecord } from "./types.js";
+import { PIPELINE, toCommChannel } from "./types.js";
 
 export interface PipelineDeps {
   cfg: Config;
@@ -125,7 +129,8 @@ export class Pipeline {
     const draft = this.crm.latestDraft(leadId);
     if (!draft) throw new Error(`lead ${leadId} has no draft`);
     if (edits.emailSubject || edits.emailBody || edits.smsBody) this.crm.updateDraft(draft.id, edits);
-    if (edits.smsConsent !== undefined) this.crm.updateLead(leadId, { smsConsent: edits.smsConsent });
+    // Goes through the manual-preferences path, which refuses consent for an SMS opt-out.
+    if (edits.smsConsent !== undefined) this.crm.setContactPreferences(leadId, { smsConsent: edits.smsConsent }, by);
     this.crm.decideDraft(draft.id, true, `approved by ${by}`);
     if (lead.status !== "approved") this.crm.setStatus(leadId, "approved", `approved by ${by}`, { force: lead.status === "skipped" });
     return this.mustLead(leadId);
@@ -165,7 +170,12 @@ export class Pipeline {
     return { sent, held };
   }
 
-  /** Attempt a single channel for a single lead. Returns null if sent, else the reason it was held. */
+  /**
+   * Attempt a single channel for a single lead under the automation rules (send window,
+   * daily caps, follow-up delay, sequence pause). The actual send goes through
+   * sendLeadEmail / sendLeadSMS, so every contactability check applies here too.
+   * Returns null if sent, else the reason it was held.
+   */
   async trySend(leadId: number, channel: Channel): Promise<string | null> {
     const lead = this.mustLead(leadId);
     const draft = this.crm.latestDraft(leadId);
@@ -175,149 +185,129 @@ export class Pipeline {
 
     const now = this.now();
     const since = startOfLocalDayIso(now, this.cfg.rules.timezone);
-    const history = this.crm.messagesForLead(leadId).filter((m) => m.direction === "outbound" && m.status !== "failed");
-    const firstEmail = history.find((m) => m.channel === "email");
+    const history = this.crm.communicationsForLead(leadId).filter((m) => m.direction === "OUTBOUND" && m.status !== "FAILED");
+    const firstEmail = history.find((m) => m.channel === "EMAIL");
     const blocker = sendBlocker(channel, lead, this.cfg.rules, {
       now,
-      sentToday: { email: this.crm.countOutboundSince("email", since), sms: this.crm.countOutboundSince("sms", since) },
+      sentToday: { email: this.crm.countOutboundSince("EMAIL", since), sms: this.crm.countOutboundSince("SMS", since) },
       isSuppressed: (v) => this.crm.isSuppressed(v),
-      firstEmailAt: firstEmail ? new Date(firstEmail.createdAt) : null,
-      alreadySent: { email: Boolean(firstEmail), sms: history.some((m) => m.channel === "sms") },
+      firstEmailAt: firstEmail ? new Date(firstEmail.sentAt ?? firstEmail.createdAt) : null,
+      alreadySent: { email: Boolean(firstEmail), sms: history.some((m) => m.channel === "SMS") },
       repliedOrBeyond: stageIndex(lead.status) >= stageIndex("replied") || stageIndex(lead.status) === -1,
     });
     if (blocker) return blocker;
 
     try {
-      let res;
       if (channel === "email") {
-        const unsubscribeUrl = this.unsubscribeUrl(leadId);
-        const { text, html } = composeEmail(this.cfg, draft.emailBody, unsubscribeUrl);
-        res = await this.deps.email!.send({ to: lead.email!, subject: draft.emailSubject, text, html, unsubscribeUrl, leadId });
-        this.crm.recordMessage({
-          leadId, draftId: draft.id, channel, direction: "outbound", provider: res.provider, providerId: res.providerId,
-          to: lead.email, subject: draft.emailSubject, body: text, status: "sent", error: null,
-        });
+        await this.sendEmail({ leadId, email: lead.email!, subject: draft.emailSubject, body: draft.emailBody }, { draftId: draft.id });
       } else {
-        const body = composeSms(draft.smsBody);
-        res = await this.deps.sms!.send({ to: lead.phone!, body, statusCallback: `${this.cfg.publicBaseUrl}/webhooks/twilio/status`, leadId });
-        this.crm.recordMessage({
-          leadId, draftId: draft.id, channel, direction: "outbound", provider: res.provider, providerId: res.providerId,
-          to: lead.phone, subject: null, body, status: "sent", error: null,
-        });
+        await this.sendSms({ leadId, phone: lead.phone!, message: draft.smsBody }, { draftId: draft.id });
       }
-      this.crm.logEvent(leadId, `${channel}.sent`, `${res.provider} ${res.providerId ?? ""}`.trim());
-      this.crm.setStatus(leadId, "sent");
       return null;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.crm.recordMessage({
-        leadId, draftId: draft.id, channel, direction: "outbound", provider: sender.name, providerId: null,
-        to: channel === "email" ? lead.email : lead.phone, subject: null, body: "", status: "failed", error: msg,
-      });
-      this.crm.logEvent(leadId, `${channel}.failed`, msg);
-      return `send failed: ${msg}`;
+      if (err instanceof SendRejectedError) return `rejected: ${err.message}`;
+      if (err instanceof ProviderSendError) return `send failed: ${err.message}`;
+      throw err;
     }
   }
 
-  // ---------- 6. CRM tracking: delivery + replies ----------
+  // ---------- explicit sends (confirmation modal, CLI) ----------
 
-  /** Provider delivery events (Resend webhooks, Twilio status callbacks). */
-  handleDeliveryEvent(provider: string, providerId: string, status: MessageStatus | "complained", error?: string): boolean {
-    const msg = this.crm.findMessageByProviderId(provider, providerId);
-    if (!msg) return false;
-    if (status === "complained") {
-      this.crm.optOut(msg.leadId, `spam complaint via ${provider}`);
-      return true;
-    }
-    // Don't let a late "sent" overwrite "delivered".
-    const rank: Record<string, number> = { queued: 0, sent: 1, delivered: 2, failed: 3, bounced: 3 };
-    if ((rank[status] ?? 0) >= (rank[msg.status] ?? 0)) this.crm.setMessageStatus(msg.id, status, error);
-    this.crm.logEvent(msg.leadId, `${msg.channel}.${status}`, error ?? provider);
-    if (status === "delivered") this.crm.setStatus(msg.leadId, "delivered");
-    if (status === "bounced") {
-      const lead = this.mustLead(msg.leadId);
-      if (msg.channel === "email" && lead.email) this.crm.suppress(lead.email, "hard bounce");
-      // Only mark the lead bounced if no other channel is still in play.
-      const others = this.crm.messagesForLead(msg.leadId).filter((m) => m.id !== msg.id && m.direction === "outbound" && ["sent", "delivered"].includes(m.status));
-      if (!others.length && stageIndex(lead.status) < stageIndex("replied")) this.crm.setStatus(msg.leadId, "bounced", error);
-    }
-    return true;
+  /** sendLeadEmail with this pipeline's database, config and Resend transport. */
+  sendEmail(input: SendLeadEmailInput, opts: SendOptions = {}) {
+    return sendLeadEmail(input, { crm: this.crm, cfg: this.cfg, sender: this.deps.email, now: this.now }, opts);
   }
 
-  /** An inbound reply (email or SMS). Classifies intent and advances the pipeline. */
-  async handleInbound(
-    channel: Channel,
+  /** sendLeadSMS with this pipeline's database, config and Twilio transport. */
+  sendSms(input: SendLeadSmsInput, opts: SendOptions = {}) {
+    return sendLeadSMS(input, { crm: this.crm, cfg: this.cfg, sender: this.deps.sms, now: this.now }, opts);
+  }
+
+  /** What the confirmation modals show: who it goes to, whether it can be sent, and the exact compliance text added. */
+  sendPreview(leadId: number): {
+    email: Contactability & { to: string | null; from: string; provider: string | null; dryRun: boolean; footer: string };
+    sms: Contactability & { to: string | null; from: string; provider: string | null; dryRun: boolean; optOutText: string };
+  } {
+    const lead = this.mustLead(leadId);
+    const emailCheck = checkEmailContactable(this.crm, lead);
+    const smsCheck = checkSmsContactable(this.crm, this.cfg, lead, this.now());
+    const footer = composeEmail(this.cfg, "", unsubscribeUrl(this.cfg, leadId)).text.trim();
+    return {
+      email: {
+        ...(this.deps.email ? emailCheck : { ok: false, code: "NOT_CONFIGURED", message: "Email sending is not configured (set RESEND_API_KEY and OUTREACH_FROM_EMAIL)." }),
+        ...(emailCheck.ok && this.deps.email && !this.cfg.emailFrom ? { ok: false, code: "NOT_CONFIGURED", message: "Set OUTREACH_FROM_EMAIL to send email." } : {}),
+        to: lead.email,
+        from: this.cfg.emailFrom,
+        provider: this.deps.email?.provider ?? null,
+        dryRun: this.deps.email?.provider === "DRY_RUN",
+        footer,
+      } as Contactability & { to: string | null; from: string; provider: string | null; dryRun: boolean; footer: string },
+      sms: {
+        ...(this.deps.sms ? smsCheck : { ok: false, code: "NOT_CONFIGURED", message: "SMS sending is not configured (set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER)." }),
+        to: toE164(lead.phone) ?? lead.phone,
+        from: this.cfg.twilioPhoneNumber,
+        provider: this.deps.sms?.provider ?? null,
+        dryRun: this.deps.sms?.provider === "DRY_RUN",
+        optOutText: composeSms("").trim(),
+      } as Contactability & { to: string | null; from: string; provider: string | null; dryRun: boolean; optOutText: string },
+    };
+  }
+
+  /** Manual change of opt-outs / consent / sequence from the dashboard (the only way to clear an opt-out). */
+  setContactPreferences(leadId: number, patch: ContactPreferencesPatch, actor = "dashboard"): Lead {
+    return this.crm.setContactPreferences(leadId, patch, actor);
+  }
+
+  // ---------- 6. CRM tracking: replies ----------
+
+  /** Claude reply classifier, or null when Claude isn't configured. */
+  get classifier(): ReplyClassifier | null {
+    const p = this.deps.personalizer;
+    return p ? (lead, text, channel) => p.classifyReply(lead, text, channel) : null;
+  }
+
+  /** Twilio inbound SMS webhook (see handleIncomingSms). */
+  handleIncomingSms(params: IncomingSms) {
+    return handleIncomingSms(params, { crm: this.crm, classify: this.classifier, now: this.now });
+  }
+
+  /**
+   * An inbound email reply (Resend inbound or the generic hook): record it, mark replied,
+   * pause the sequence, and classify. `classification` resolves when Claude is done.
+   */
+  handleInboundEmail(
     from: string,
     text: string,
-    provider: string,
-    providerId: string | null = null,
-  ): Promise<{ lead: Lead | null; intent: ReplyClassification["classification"] | null; classification?: ReplyClassification }> {
-    const address = channel === "email" ? extractAddress(from) : from;
-    const lead = channel === "email" ? this.crm.findLeadByEmail(address) : this.crm.findLeadByPhone(address);
+    provider: "RESEND" | "INBOUND_HOOK",
+    providerMessageId: string | null = null,
+    subject: string | null = null,
+  ): { lead: Lead | null; communicationId: number | null; classification: Promise<ReplyClassificationRecord | null> } {
+    const address = extractAddress(from);
+    const lead = this.crm.findLeadByEmail(address);
     if (!lead) {
-      // Still honour STOP from unknown numbers/addresses.
-      if (isOptOut(text)) this.crm.suppress(address, `${channel} opt-out from unknown sender`);
-      return { lead: null, intent: null };
+      // Honour opt-outs even from addresses we don't know yet.
+      if (isOptOutPhrase(text)) this.crm.suppress(address, "email opt-out from unknown sender");
+      return { lead: null, communicationId: null, classification: Promise.resolve(null) };
     }
-    this.crm.recordMessage({
-      leadId: lead.id, draftId: null, channel, direction: "inbound", provider, providerId,
-      to: null, subject: null, body: text, status: "received", error: null,
+    if (providerMessageId && this.crm.findCommunicationByProviderId(provider, providerMessageId)) {
+      return { lead, communicationId: null, classification: Promise.resolve(null) };
+    }
+    const comm = this.crm.tx(() => {
+      const c = this.crm.recordCommunication({
+        leadId: lead.id, direction: "INBOUND", channel: "EMAIL", provider, providerMessageId,
+        sender: address, subject, body: text.slice(0, 20000), status: "RECEIVED", sentAt: this.now().toISOString(),
+      });
+      this.crm.markReplied(lead.id);
+      return c;
     });
-
-    let cls: ReplyClassification;
-    if (isOptOut(text)) {
-      cls = { classification: "UNSUBSCRIBE", sentiment: "NEGATIVE", recommendedAction: "Opt-out keyword: do not contact again.", shouldPauseSequence: true };
-    } else if (this.deps.personalizer) {
-      try {
-        cls = await this.deps.personalizer.classifyReply(lead, text, channel);
-      } catch (err) {
-        cls = {
-          classification: "OTHER",
-          sentiment: "NEUTRAL",
-          recommendedAction: `Read and reply manually (classification failed: ${err instanceof Error ? err.message : err})`,
-          shouldPauseSequence: true,
-        };
-      }
-    } else {
-      cls = { classification: "OTHER", sentiment: "NEUTRAL", recommendedAction: "Read and reply manually.", shouldPauseSequence: true };
-    }
-    this.applyClassification(lead.id, channel, cls, text);
-    return { lead: this.mustLead(lead.id), intent: cls.classification, classification: cls };
-  }
-
-  /** Move the lead through the CRM according to a reply classification. */
-  applyClassification(leadId: number, channel: Channel, cls: ReplyClassification, text = ""): void {
-    this.crm.logEvent(leadId, `${channel}.reply`, `${cls.classification} (${cls.sentiment}): ${cls.recommendedAction}`);
-    switch (cls.classification) {
-      case "UNSUBSCRIBE":
-        this.crm.optOut(leadId, `${channel} reply: ${text.slice(0, 80)}`);
-        break;
-      case "NOT_INTERESTED":
-        this.crm.setStatus(leadId, "replied");
-        this.crm.setStatus(leadId, "lost", cls.recommendedAction);
-        break;
-      case "MEETING_BOOKED":
-        this.crm.setStatus(leadId, "replied");
-        this.crm.setStatus(leadId, "interested");
-        this.crm.setStatus(leadId, "booked", cls.recommendedAction);
-        break;
-      case "INTERESTED":
-        this.crm.setStatus(leadId, "replied");
-        this.crm.setStatus(leadId, "interested", cls.recommendedAction);
-        break;
-      case "OUT_OF_OFFICE":
-        if (!cls.shouldPauseSequence) break; // auto-reply: keep the sequence going
-        this.crm.setStatus(leadId, "replied", cls.recommendedAction);
-        break;
-      default: // QUESTION, WRONG_PERSON, OTHER: a human needs to look
-        this.crm.setStatus(leadId, "replied", cls.recommendedAction);
-    }
+    const classification = classifyAndApply({ crm: this.crm, lead, channel: "email", text, communicationId: comm.id, classify: this.classifier, now: this.now });
+    return { lead, communicationId: comm.id, classification };
   }
 
   /** Manual pipeline moves from the dashboard (e.g. booked → closed, or lost). */
   markStage(leadId: number, stage: LeadStatus, note?: string): Lead {
     const lead = this.mustLead(leadId);
-    if (stage === "opted_out") this.crm.optOut(leadId, note ?? "manual");
+    if (stage === "opted_out") this.crm.optOut(leadId, { all: true }, note ?? "marked opted out manually");
     else this.crm.setStatus(leadId, stage, note ?? `manual: ${lead.status} → ${stage}`, { force: true });
     return this.mustLead(leadId);
   }
@@ -359,8 +349,8 @@ export class Pipeline {
   /** Draft a follow-up from the lead's message history. Returned for review only — not saved as the outreach draft, not sent. */
   async generateFollowUp(leadId: number, channel: "EMAIL" | "SMS"): Promise<FollowUp> {
     const lead = this.mustLead(leadId);
-    const history = this.crm.messagesForLead(leadId).filter((m) => m.status !== "failed" && m.body);
-    const outbound = history.filter((m) => m.direction === "outbound");
+    const history = this.crm.communicationsForLead(leadId).filter((m) => m.status !== "FAILED" && m.body);
+    const outbound = history.filter((m) => m.direction === "OUTBOUND");
     const last = history.at(-1);
     const result = await this.requireClaude().generateFollowUp({
       lead: leadToInput(lead),
@@ -368,13 +358,13 @@ export class Pipeline {
       channel,
       followUpNumber: Math.max(1, outbound.length),
       previousMessages: history.slice(-10).map((m) => ({
-        channel: m.channel === "email" ? "EMAIL" : "SMS",
-        direction: m.direction === "outbound" ? "OUTBOUND" : "INBOUND",
+        channel: m.channel,
+        direction: m.direction,
         subject: m.subject ?? "",
         body: m.body.slice(0, 6000),
-        sentAt: m.createdAt,
+        sentAt: m.sentAt ?? m.createdAt,
       })),
-      daysSinceLastMessage: last ? Math.floor((this.now().getTime() - new Date(last.createdAt).getTime()) / 86_400_000) : undefined,
+      daysSinceLastMessage: last ? Math.floor((this.now().getTime() - new Date(last.sentAt ?? last.createdAt).getTime()) / 86_400_000) : undefined,
     });
     this.crm.logEvent(leadId, "ai.follow_up_generated", channel);
     return result;
@@ -383,14 +373,23 @@ export class Pipeline {
   /** Classify a reply pasted in by a human (e.g. one received outside the webhooks) and update the CRM. */
   async classifyLeadReply(leadId: number, replyText: string, channel: Channel = "email"): Promise<ReplyClassification> {
     const lead = this.mustLead(leadId);
-    const cls = isOptOut(replyText)
-      ? { classification: "UNSUBSCRIBE" as const, sentiment: "NEGATIVE" as const, recommendedAction: "Opt-out keyword: do not contact again.", shouldPauseSequence: true }
-      : await this.requireClaude().classifyReply({ replyText, channel: channel === "email" ? "EMAIL" : "SMS", businessName: lead.businessName });
-    this.crm.recordMessage({
-      leadId, draftId: null, channel, direction: "inbound", provider: "manual", providerId: null,
-      to: null, subject: null, body: replyText, status: "received", error: null,
+    const claude = isOptOutPhrase(replyText) ? null : this.requireClaude();
+    const cls: ReplyClassification = claude
+      ? await claude.classifyReply({ replyText, channel: channel === "email" ? "EMAIL" : "SMS", businessName: lead.businessName })
+      : { classification: "UNSUBSCRIBE", sentiment: "NEGATIVE", recommendedAction: "Lead asked to stop. Do not contact again.", shouldPauseSequence: true };
+    const comm = this.crm.tx(() => {
+      const c = this.crm.recordCommunication({
+        leadId, direction: "INBOUND", channel: toCommChannel(channel), provider: "MANUAL",
+        sender: channel === "email" ? lead.email : lead.phone, body: replyText, status: "RECEIVED", sentAt: this.now().toISOString(),
+      });
+      this.crm.markReplied(leadId);
+      return c;
     });
-    this.applyClassification(leadId, channel, cls, replyText);
+    // Reuse the stored-classification path with the result we already have.
+    await classifyAndApply({
+      crm: this.crm, lead, channel, text: replyText, communicationId: comm.id,
+      classify: async () => cls, now: this.now,
+    });
     return cls;
   }
 
@@ -415,20 +414,15 @@ export class Pipeline {
 
   // ---------- unsubscribe links ----------
 
-  unsubscribeToken(leadId: number): string {
-    return createHmac("sha256", this.cfg.appSecret).update(`unsub:${leadId}`).digest("base64url").slice(0, 32);
-  }
-
   unsubscribeUrl(leadId: number): string {
-    return `${this.cfg.publicBaseUrl}/unsubscribe/${leadId}/${this.unsubscribeToken(leadId)}`;
+    return unsubscribeUrl(this.cfg, leadId);
   }
 
+  /** Signed unsubscribe link: opts the lead out of email (permanently, until changed manually). */
   unsubscribe(leadId: number, token: string): boolean {
-    const expected = Buffer.from(this.unsubscribeToken(leadId));
-    const got = Buffer.from(token);
-    if (got.length !== expected.length || !timingSafeEqual(got, expected)) return false;
+    if (!verifyUnsubscribeToken(this.cfg.appSecret, leadId, token)) return false;
     if (!this.crm.getLead(leadId)) return false;
-    this.crm.optOut(leadId, "unsubscribe link");
+    this.crm.optOut(leadId, { email: true }, "unsubscribe link");
     return true;
   }
 

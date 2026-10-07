@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import { fakeFetch, makePipeline, OLD_SITE, testConfig } from "./helpers.js";
 import { verifyResendWebhook } from "../src/channels/email.js";
-import { verifyTwilioSignature } from "../src/channels/sms.js";
+import { validateTwilioWebhook } from "../src/services/sms/twilio.js";
+import { applyDeliveryUpdate } from "../src/services/delivery.js";
 
 const places = {
   places: [
@@ -47,7 +48,7 @@ test("end to end: find → enrich → draft → auto-approve → send → delive
   assert.equal(crm.getLead(joeId)!.status, "approved");
 
   // grant SMS consent (e.g. they filled a form) so the text can go out later
-  crm.updateLead(joeId, { smsConsent: true });
+  crm.setContactPreferences(joeId, { smsConsent: true }, "test");
 
   const r1 = await pipeline.sendDue();
   assert.deepEqual(r1.sent, [{ leadId: joeId, channel: "email" }]);
@@ -55,10 +56,14 @@ test("end to end: find → enrich → draft → auto-approve → send → delive
   assert.equal(email.sent.length, 1);
   assert.match(email.sent[0].text, /Unsubscribe: https:\/\/crm\.example\.test\/unsubscribe\//);
   assert.equal(crm.getLead(joeId)!.status, "sent");
+  assert.equal(crm.getLead(joeId)!.emailStatus, "SENT");
 
-  const emailMsg = crm.messagesForLead(joeId)[0];
-  assert.ok(pipeline.handleDeliveryEvent(emailMsg.provider, emailMsg.providerId!, "delivered"));
+  const emailMsg = crm.communicationsForLead(joeId)[0];
+  assert.equal(emailMsg.direction, "OUTBOUND");
+  assert.equal(emailMsg.channel, "EMAIL");
+  assert.ok(applyDeliveryUpdate(crm, { provider: emailMsg.provider, providerMessageId: emailMsg.providerMessageId!, update: "DELIVERED" }));
   assert.equal(crm.getLead(joeId)!.status, "delivered");
+  assert.equal(crm.getLead(joeId)!.emailStatus, "DELIVERED");
 
   advance(3);
   const r2 = await pipeline.sendDue();
@@ -67,13 +72,16 @@ test("end to end: find → enrich → draft → auto-approve → send → delive
   const r3 = await pipeline.sendDue();
   assert.equal(r3.sent.length, 0, "never double-sends");
 
-  const reply = await pipeline.handleInbound("email", "Joe Smith <JOE@joesplumbing.com>", "Sure, tell me more", "resend");
-  assert.equal(reply.intent, "INTERESTED");
-  assert.equal(crm.getLead(joeId)!.status, "interested");
+  const reply = pipeline.handleInboundEmail("Joe Smith <JOE@joesplumbing.com>", "Sure, tell me more", "RESEND");
+  assert.equal((await reply.classification)?.classification, "INTERESTED");
+  const after = crm.getLead(joeId)!;
+  assert.equal(after.status, "interested");
+  assert.equal(after.replied, true);
+  assert.equal(after.sequencePaused, true);
 
   // late delivery webhook must not regress the stage
-  const smsMsg = crm.messagesForLead(joeId).find((m) => m.channel === "sms")!;
-  pipeline.handleDeliveryEvent(smsMsg.provider, smsMsg.providerId!, "delivered");
+  const smsMsg = crm.communicationsForLead(joeId).find((m) => m.channel === "SMS" && m.direction === "OUTBOUND")!;
+  applyDeliveryUpdate(crm, { provider: smsMsg.provider, providerMessageId: smsMsg.providerMessageId!, update: "DELIVERED" });
   assert.equal(crm.getLead(joeId)!.status, "interested");
 
   pipeline.markStage(joeId, "booked");
@@ -102,20 +110,23 @@ test("lead with no website or email is queued for review, not auto-sent", async 
   assert.equal(email.sent.length, 0);
 });
 
-test("STOP reply opts the lead out and suppresses future sends", async () => {
+test("STOP text opts the lead out of SMS (only) and blocks future texts", async () => {
   const { pipeline, crm } = setup();
   const { created } = await pipeline.findLeads({ industry: "plumber", city: "Austin" });
   const id = created[0].id;
   await pipeline.enrich(id);
   await pipeline.draft(id);
   await pipeline.sendDue();
-  const r = await pipeline.handleInbound("sms", "+1 (512) 555-0100", "STOP", "twilio");
-  assert.equal(r.intent, "UNSUBSCRIBE");
+  const r = pipeline.handleIncomingSms({ From: "+1 (512) 555-0100", To: "+15125550000", Body: "STOP", MessageSid: "SMstop1" });
+  assert.equal(r.kind, "opt_out");
+  assert.equal((await r.classification)?.classification, "UNSUBSCRIBE");
   const lead = crm.getLead(id)!;
-  assert.equal(lead.status, "opted_out");
-  assert.ok(crm.isSuppressed("joe@joesplumbing.com"));
+  assert.equal(lead.smsOptOut, true);
+  assert.equal(lead.emailOptOut, false, "STOP is SMS-only");
+  assert.notEqual(lead.status, "opted_out", "email is still a valid channel");
   assert.ok(crm.isSuppressed("5125550100"));
-  assert.match((await pipeline.trySend(id, "sms"))!, /opted out|already/);
+  assert.ok(!crm.isSuppressed("joe@joesplumbing.com"));
+  assert.match((await pipeline.trySend(id, "sms"))!, /opted out|already|replied|paused/);
 });
 
 test("unsubscribe link token is verified", async () => {
@@ -125,7 +136,7 @@ test("unsubscribe link token is verified", async () => {
   assert.equal(pipeline.unsubscribe(id, "wrong-token-wrong-token-wrong-to"), false);
   const token = pipeline.unsubscribeUrl(id).split("/").pop()!;
   assert.equal(pipeline.unsubscribe(id, token), true);
-  assert.equal(crm.getLead(id)!.optedOut, true);
+  assert.equal(crm.getLead(id)!.emailOptOut, true);
 });
 
 test("bounce suppresses the address", async () => {
@@ -135,9 +146,10 @@ test("bounce suppresses the address", async () => {
   await pipeline.enrich(id);
   await pipeline.draft(id);
   await pipeline.sendDue();
-  const m = crm.messagesForLead(id)[0];
-  pipeline.handleDeliveryEvent(m.provider, m.providerId!, "bounced", "mailbox does not exist");
+  const m = crm.communicationsForLead(id)[0];
+  applyDeliveryUpdate(crm, { provider: m.provider, providerMessageId: m.providerMessageId!, update: "BOUNCED", error: "mailbox does not exist" });
   assert.equal(crm.getLead(id)!.status, "bounced");
+  assert.equal(crm.getLead(id)!.emailStatus, "BOUNCED");
   assert.ok(crm.isSuppressed("joe@joesplumbing.com"));
 });
 
@@ -151,11 +163,13 @@ test("Resend (Svix) webhook signature", () => {
   assert.equal(verifyResendWebhook(secret, { id: "msg_1", timestamp: "1000", signature: `v1,${sig}` }, body), false);
 });
 
-test("Twilio webhook signature", () => {
-  const url = "https://crm.example.test/webhooks/twilio/inbound";
+test("Twilio webhook signature (official SDK validator)", () => {
+  const url = "https://crm.example.test/api/webhooks/twilio/incoming";
   const params = { From: "+15125550100", Body: "Yes", MessageSid: "SM1" };
   const data = url + "BodyYes" + "From+15125550100" + "MessageSidSM1";
   const sig = createHmac("sha1", "tok").update(data).digest("base64");
-  assert.equal(verifyTwilioSignature("tok", url, params, sig), true);
-  assert.equal(verifyTwilioSignature("tok", url, { ...params, Body: "No" }, sig), false);
+  assert.equal(validateTwilioWebhook("tok", sig, url, params), true);
+  assert.equal(validateTwilioWebhook("tok", sig, url, { ...params, Body: "No" }), false);
+  assert.equal(validateTwilioWebhook("tok", undefined, url, params), false);
+  assert.equal(validateTwilioWebhook("", sig, url, params), false);
 });

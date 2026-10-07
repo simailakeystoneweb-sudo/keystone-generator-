@@ -1,16 +1,22 @@
 import { DatabaseSync } from "node:sqlite";
 import type {
-  Channel,
+  CommChannel,
+  CommProvider,
+  CommStatus,
+  Communication,
   Draft,
+  EmailStatus,
   Lead,
   LeadAnalysisRecord,
   LeadStatus,
-  MessageStatus,
-  OutboundMessage,
   RawBusiness,
+  ReplyClassificationRecord,
+  SmsStatus,
   WebsiteAudit,
 } from "../types.js";
 import { PIPELINE } from "../types.js";
+
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS leads (
@@ -31,7 +37,6 @@ CREATE TABLE IF NOT EXISTS leads (
   score INTEGER,
   status TEXT NOT NULL DEFAULT 'new',
   sms_consent INTEGER NOT NULL DEFAULT 0,
-  opted_out INTEGER NOT NULL DEFAULT 0,
   notes TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -53,23 +58,30 @@ CREATE TABLE IF NOT EXISTS drafts (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
-CREATE TABLE IF NOT EXISTS messages (
+CREATE TABLE IF NOT EXISTS communications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
   draft_id INTEGER REFERENCES drafts(id),
-  channel TEXT NOT NULL,
-  direction TEXT NOT NULL,
+  campaign_id TEXT,
+  direction TEXT NOT NULL CHECK (direction IN ('OUTBOUND','INBOUND')),
+  channel TEXT NOT NULL CHECK (channel IN ('EMAIL','SMS')),
   provider TEXT NOT NULL,
-  provider_id TEXT,
+  provider_message_id TEXT,
+  idempotency_key TEXT,
   recipient TEXT,
+  sender TEXT,
   subject TEXT,
   body TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT,
+  classification_json TEXT,
+  sent_at TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
-CREATE INDEX IF NOT EXISTS messages_provider_idx ON messages(provider, provider_id);
+CREATE UNIQUE INDEX IF NOT EXISTS communications_provider_msg_uq ON communications(provider, provider_message_id) WHERE provider_message_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS communications_idempotency_uq ON communications(idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS communications_lead_idx ON communications(lead_id);
 
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,7 +122,17 @@ function rowToLead(r: Row): Lead {
     score: r.score == null ? null : Number(r.score),
     status: r.status as LeadStatus,
     smsConsent: Boolean(r.sms_consent),
-    optedOut: Boolean(r.opted_out),
+    emailOptOut: Boolean(r.email_opt_out),
+    smsOptOut: Boolean(r.sms_opt_out),
+    doNotContact: Boolean(r.do_not_contact),
+    emailStatus: (r.email_status as EmailStatus) ?? null,
+    smsStatus: (r.sms_status as SmsStatus) ?? null,
+    lastContactedAt: (r.last_contacted_at as string) ?? null,
+    replied: Boolean(r.replied),
+    sequencePaused: Boolean(r.sequence_paused),
+    lastReplyClassification: r.last_reply_classification_json
+      ? (JSON.parse(String(r.last_reply_classification_json)) as ReplyClassificationRecord)
+      : null,
     notes: (r.notes as string) ?? null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
@@ -131,23 +153,59 @@ function rowToDraft(r: Row): Draft {
   };
 }
 
-function rowToMessage(r: Row): OutboundMessage {
+function rowToCommunication(r: Row): Communication {
   return {
     id: Number(r.id),
     leadId: Number(r.lead_id),
     draftId: r.draft_id == null ? null : Number(r.draft_id),
-    channel: r.channel as Channel,
-    direction: r.direction as "outbound" | "inbound",
-    provider: String(r.provider),
-    providerId: (r.provider_id as string) ?? null,
-    to: (r.recipient as string) ?? null,
+    campaignId: (r.campaign_id as string) ?? null,
+    direction: r.direction as Communication["direction"],
+    channel: r.channel as CommChannel,
+    provider: r.provider as CommProvider,
+    providerMessageId: (r.provider_message_id as string) ?? null,
+    recipient: (r.recipient as string) ?? null,
+    sender: (r.sender as string) ?? null,
     subject: (r.subject as string) ?? null,
     body: String(r.body),
-    status: r.status as MessageStatus,
+    status: r.status as CommStatus,
     error: (r.error as string) ?? null,
+    classification: r.classification_json ? (JSON.parse(String(r.classification_json)) as ReplyClassificationRecord) : null,
+    sentAt: (r.sent_at as string) ?? null,
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
   };
+}
+
+/** Stages before first contact. Sending the first message moves these to "sent" (contacted). */
+export const PRE_CONTACT_STAGES: readonly LeadStatus[] = ["new", "enriched", "drafted", "pending_approval", "approved"];
+
+const DELIVERY_RANK: Record<string, number> = { SENT: 1, DELIVERED: 2, FAILED: 3, UNDELIVERED: 3, BOUNCED: 3, COMPLAINED: 4 };
+
+export interface NewCommunication {
+  leadId: number;
+  draftId?: number | null;
+  campaignId?: string | null;
+  direction: Communication["direction"];
+  channel: CommChannel;
+  provider: CommProvider;
+  providerMessageId?: string | null;
+  idempotencyKey?: string | null;
+  recipient?: string | null;
+  sender?: string | null;
+  subject?: string | null;
+  body: string;
+  status: CommStatus;
+  error?: string | null;
+  classification?: ReplyClassificationRecord | null;
+  sentAt?: string | null;
+}
+
+export interface ContactPreferencesPatch {
+  emailOptOut?: boolean;
+  smsOptOut?: boolean;
+  doNotContact?: boolean;
+  smsConsent?: boolean;
+  sequencePaused?: boolean;
 }
 
 export function normalizePhone(phone: string | null | undefined): string | null {
@@ -185,11 +243,73 @@ export class CRM {
     this.migrate();
   }
 
-  /** Additive column migrations for databases created by older versions. */
+  /**
+   * Versioned migrations (PRAGMA user_version). Each step is idempotent, so a fresh
+   * database simply runs them as no-ops once.
+   */
   private migrate(): void {
-    const cols = new Set((this.db.prepare("PRAGMA table_info(leads)").all() as Row[]).map((r) => String(r.name)));
-    for (const [name, type] of [["description", "TEXT"], ["analysis_json", "TEXT"]] as const) {
-      if (!cols.has(name)) this.db.exec(`ALTER TABLE leads ADD COLUMN ${name} ${type}`);
+    const version = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
+    if (version >= SCHEMA_VERSION) return;
+    this.tx(() => {
+      const cols = new Set((this.db.prepare("PRAGMA table_info(leads)").all() as Row[]).map((r) => String(r.name)));
+      const add = (name: string, type: string) => {
+        if (!cols.has(name)) this.db.exec(`ALTER TABLE leads ADD COLUMN ${name} ${type}`);
+      };
+      // v1: Claude analysis
+      add("description", "TEXT");
+      add("analysis_json", "TEXT");
+      // v2: per-channel contact preferences, delivery state, reply tracking
+      add("email_opt_out", "INTEGER NOT NULL DEFAULT 0");
+      add("sms_opt_out", "INTEGER NOT NULL DEFAULT 0");
+      add("do_not_contact", "INTEGER NOT NULL DEFAULT 0");
+      add("email_status", "TEXT");
+      add("sms_status", "TEXT");
+      add("last_contacted_at", "TEXT");
+      add("replied", "INTEGER NOT NULL DEFAULT 0");
+      add("sequence_paused", "INTEGER NOT NULL DEFAULT 0");
+      add("last_reply_classification_json", "TEXT");
+      // The old single opt-out flag meant "never contact": carry it onto every new flag.
+      if (cols.has("opted_out")) {
+        this.db.exec("UPDATE leads SET email_opt_out = 1, sms_opt_out = 1, do_not_contact = 1 WHERE opted_out = 1");
+      }
+      // v2: messages → communications (uppercase enums, provider_message_id, sent_at)
+      const hasMessages = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'").get();
+      if (hasMessages) {
+        this.db.exec(`
+          INSERT INTO communications (lead_id, draft_id, direction, channel, provider, provider_message_id, recipient, subject, body, status, error, sent_at, created_at, updated_at)
+          SELECT lead_id, draft_id, UPPER(direction), UPPER(channel),
+                 CASE provider WHEN 'dryrun-email' THEN 'DRY_RUN' WHEN 'dryrun-sms' THEN 'DRY_RUN' WHEN 'inbound-hook' THEN 'INBOUND_HOOK' ELSE UPPER(provider) END,
+                 provider_id, recipient, subject, body, UPPER(status), error,
+                 CASE WHEN status = 'failed' THEN NULL ELSE created_at END, created_at, updated_at
+          FROM messages ORDER BY id;
+          DROP TABLE messages;
+        `);
+        this.db.exec(`
+          UPDATE leads SET last_contacted_at = (SELECT MAX(sent_at) FROM communications c WHERE c.lead_id = leads.id AND c.direction = 'OUTBOUND')
+          WHERE last_contacted_at IS NULL;
+          UPDATE leads SET replied = 1, sequence_paused = 1 WHERE EXISTS (SELECT 1 FROM communications c WHERE c.lead_id = leads.id AND c.direction = 'INBOUND');
+        `);
+      }
+      this.db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    });
+  }
+
+  private txDepth = 0;
+
+  /** Run `fn` atomically. Nested calls join the outer transaction. */
+  tx<T>(fn: () => T): T {
+    if (this.txDepth > 0) return fn();
+    this.db.exec("BEGIN IMMEDIATE");
+    this.txDepth++;
+    try {
+      const out = fn();
+      this.db.exec("COMMIT");
+      return out;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    } finally {
+      this.txDepth--;
     }
   }
 
@@ -325,15 +445,104 @@ export class CRM {
     return true;
   }
 
-  optOut(id: number, reason: string): void {
+  /**
+   * Record an opt-out. `email`/`sms` are channel opt-outs; `all` sets do_not_contact.
+   * Opt-outs are permanent: nothing in the app clears them except setContactPreferences
+   * (a deliberate manual change). The lead's stage becomes opted_out only once no
+   * channel is left to contact them on.
+   */
+  optOut(id: number, scope: { email?: boolean; sms?: boolean; all?: boolean }, reason: string): Lead | null {
+    const lead = this.getLead(id);
+    if (!lead) return null;
+    const email = Boolean(scope.email || scope.all);
+    const sms = Boolean(scope.sms || scope.all);
+    this.tx(() => {
+      this.db
+        .prepare(
+          `UPDATE leads SET
+             email_opt_out = MAX(email_opt_out, ?), sms_opt_out = MAX(sms_opt_out, ?), do_not_contact = MAX(do_not_contact, ?),
+             sms_consent = CASE WHEN ? THEN 0 ELSE sms_consent END,
+             sequence_paused = 1,
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE id = ?`,
+        )
+        .run(email ? 1 : 0, sms ? 1 : 0, scope.all ? 1 : 0, sms ? 1 : 0, id);
+      if (email && lead.email) this.suppress(lead.email, reason);
+      if (sms && lead.phone) this.suppress(lead.phone, reason);
+      const which = scope.all ? "all contact" : [email && "email", sms && "SMS"].filter(Boolean).join(" + ");
+      this.logEvent(id, "contact.opt_out", `${which}: ${reason}`);
+      const after = this.getLead(id)!;
+      const emailGone = after.doNotContact || after.emailOptOut || !after.email;
+      const smsGone = after.doNotContact || after.smsOptOut || !after.phone;
+      if (emailGone && smsGone && after.status !== "opted_out") this.setStatus(id, "opted_out", reason, { force: true });
+    });
+    return this.getLead(id);
+  }
+
+  /**
+   * Manual change of contact preferences from the dashboard. This is the only path
+   * that can clear an opt-out; clearing one also lifts that channel's suppression.
+   */
+  setContactPreferences(id: number, patch: ContactPreferencesPatch, actor: string): Lead {
+    const lead = this.getLead(id);
+    if (!lead) throw new Error(`lead ${id} not found`);
+    const changes: string[] = [];
+    this.tx(() => {
+      const set = (col: string, v: boolean | undefined, current: boolean, label: string) => {
+        if (v === undefined || v === current) return;
+        this.db.prepare(`UPDATE leads SET ${col} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`).run(v ? 1 : 0, id);
+        changes.push(`${label} ${current} → ${v}`);
+      };
+      set("email_opt_out", patch.emailOptOut, lead.emailOptOut, "email_opt_out");
+      set("sms_opt_out", patch.smsOptOut, lead.smsOptOut, "sms_opt_out");
+      set("do_not_contact", patch.doNotContact, lead.doNotContact, "do_not_contact");
+      set("sequence_paused", patch.sequencePaused, lead.sequencePaused, "sequence_paused");
+      // Consent can't be recorded while the lead is opted out of SMS.
+      const smsOut = patch.smsOptOut ?? lead.smsOptOut;
+      if (patch.smsConsent && smsOut) throw new Error("cannot record SMS consent while the lead is opted out of SMS");
+      set("sms_consent", patch.smsConsent, lead.smsConsent, "sms_consent");
+      if (patch.emailOptOut === true && lead.email) this.suppress(lead.email, `manual opt-out by ${actor}`);
+      if (patch.smsOptOut === true && lead.phone) this.suppress(lead.phone, `manual opt-out by ${actor}`);
+      if (patch.emailOptOut === false && lead.email) this.unsuppress(lead.email);
+      if (patch.smsOptOut === false && lead.phone) this.unsuppress(lead.phone);
+      if (changes.length) this.logEvent(id, "contact.manual_change", `${actor}: ${changes.join(", ")}`);
+    });
+    return this.getLead(id)!;
+  }
+
+  /** After a successful send: delivery status SENT, last_contacted_at, and first contact moves the stage to "sent". */
+  markContacted(id: number, channel: CommChannel, atIso: string): void {
+    this.tx(() => {
+      const col = channel === "EMAIL" ? "email_status" : "sms_status";
+      this.db
+        .prepare(`UPDATE leads SET ${col} = 'SENT', last_contacted_at = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`)
+        .run(atIso, id);
+      const lead = this.getLead(id)!;
+      if (PRE_CONTACT_STAGES.includes(lead.status)) this.setStatus(id, "sent", `contacted by ${channel}`);
+    });
+  }
+
+  /** Provider delivery updates. Never moves backwards (a late "sent" can't undo "delivered"). */
+  setDeliveryStatus(id: number, channel: CommChannel, status: EmailStatus | SmsStatus): void {
     const lead = this.getLead(id);
     if (!lead) return;
+    const current = channel === "EMAIL" ? lead.emailStatus : lead.smsStatus;
+    if (current && (DELIVERY_RANK[status] ?? 0) < (DELIVERY_RANK[current] ?? 0)) return;
+    const col = channel === "EMAIL" ? "email_status" : "sms_status";
+    this.db.prepare(`UPDATE leads SET ${col} = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?`).run(status, id);
+  }
+
+  /** Any reply: mark replied and pause automated follow-ups. */
+  markReplied(id: number): void {
     this.db
-      .prepare("UPDATE leads SET opted_out = 1, sms_consent = 0, status = 'opted_out', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
+      .prepare("UPDATE leads SET replied = 1, sequence_paused = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
       .run(id);
-    if (lead.email) this.suppress(lead.email, reason);
-    if (lead.phone) this.suppress(lead.phone, reason);
-    this.logEvent(id, "status.opted_out", reason);
+  }
+
+  setLastReplyClassification(id: number, cls: ReplyClassificationRecord): void {
+    this.db
+      .prepare("UPDATE leads SET last_reply_classification_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
+      .run(JSON.stringify(cls), id);
   }
 
   // ---------- suppression list ----------
@@ -342,6 +551,11 @@ export class CRM {
     const v = suppressionKey(value);
     if (!v) return;
     this.db.prepare("INSERT OR IGNORE INTO suppressions (value, reason) VALUES (?, ?)").run(v, reason);
+  }
+
+  unsuppress(value: string): void {
+    const v = suppressionKey(value);
+    if (v) this.db.prepare("DELETE FROM suppressions WHERE value = ?").run(v);
   }
 
   isSuppressed(value: string | null | undefined): boolean {
@@ -383,42 +597,74 @@ export class CRM {
     this.db.prepare("UPDATE drafts SET approved = ?, decision = ? WHERE id = ?").run(approved ? 1 : 0, decision, id);
   }
 
-  // ---------- messages ----------
+  // ---------- communications ----------
 
-  recordMessage(m: Omit<OutboundMessage, "id" | "createdAt" | "updatedAt">): OutboundMessage {
+  recordCommunication(c: NewCommunication): Communication {
     const res = this.db
       .prepare(
-        `INSERT INTO messages (lead_id, draft_id, channel, direction, provider, provider_id, recipient, subject, body, status, error)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO communications (lead_id, draft_id, campaign_id, direction, channel, provider, provider_message_id, idempotency_key,
+           recipient, sender, subject, body, status, error, classification_json, sent_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(m.leadId, m.draftId, m.channel, m.direction, m.provider, m.providerId, m.to, m.subject, m.body, m.status, m.error);
-    return this.getMessage(Number(res.lastInsertRowid))!;
+      .run(
+        c.leadId,
+        c.draftId ?? null,
+        c.campaignId ?? null,
+        c.direction,
+        c.channel,
+        c.provider,
+        c.providerMessageId ?? null,
+        c.idempotencyKey ?? null,
+        c.recipient ?? null,
+        c.sender ?? null,
+        c.subject ?? null,
+        c.body,
+        c.status,
+        c.error ?? null,
+        c.classification ? JSON.stringify(c.classification) : null,
+        c.sentAt ?? null,
+      );
+    return this.getCommunication(Number(res.lastInsertRowid))!;
   }
 
-  getMessage(id: number): OutboundMessage | null {
-    const r = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id) as Row | undefined;
-    return r ? rowToMessage(r) : null;
+  getCommunication(id: number): Communication | null {
+    const r = this.db.prepare("SELECT * FROM communications WHERE id = ?").get(id) as Row | undefined;
+    return r ? rowToCommunication(r) : null;
   }
 
-  findMessageByProviderId(provider: string, providerId: string): OutboundMessage | null {
-    const r = this.db.prepare("SELECT * FROM messages WHERE provider = ? AND provider_id = ?").get(provider, providerId) as Row | undefined;
-    return r ? rowToMessage(r) : null;
+  findCommunicationByProviderId(provider: CommProvider, providerMessageId: string): Communication | null {
+    const r = this.db
+      .prepare("SELECT * FROM communications WHERE provider = ? AND provider_message_id = ?")
+      .get(provider, providerMessageId) as Row | undefined;
+    return r ? rowToCommunication(r) : null;
   }
 
-  setMessageStatus(id: number, status: MessageStatus, error?: string | null): void {
+  /** Successful send previously recorded under this idempotency key (used to make retries safe). */
+  findCommunicationByIdempotencyKey(key: string): Communication | null {
+    const r = this.db.prepare("SELECT * FROM communications WHERE idempotency_key = ?").get(key) as Row | undefined;
+    return r ? rowToCommunication(r) : null;
+  }
+
+  setCommunicationStatus(id: number, status: CommStatus, error?: string | null): void {
     this.db
-      .prepare("UPDATE messages SET status = ?, error = COALESCE(?, error), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
+      .prepare("UPDATE communications SET status = ?, error = COALESCE(?, error), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
       .run(status, error ?? null, id);
   }
 
-  messagesForLead(leadId: number): OutboundMessage[] {
-    return (this.db.prepare("SELECT * FROM messages WHERE lead_id = ? ORDER BY id").all(leadId) as Row[]).map(rowToMessage);
+  setCommunicationClassification(id: number, cls: ReplyClassificationRecord): void {
+    this.db
+      .prepare("UPDATE communications SET classification_json = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?")
+      .run(JSON.stringify(cls), id);
   }
 
-  /** Outbound messages on `channel` created since `sinceIso` (used for daily caps). */
-  countOutboundSince(channel: Channel, sinceIso: string): number {
+  communicationsForLead(leadId: number): Communication[] {
+    return (this.db.prepare("SELECT * FROM communications WHERE lead_id = ? ORDER BY id").all(leadId) as Row[]).map(rowToCommunication);
+  }
+
+  /** Outbound messages on `channel` sent since `sinceIso` (used for daily caps). */
+  countOutboundSince(channel: CommChannel, sinceIso: string): number {
     const r = this.db
-      .prepare("SELECT COUNT(*) AS n FROM messages WHERE channel = ? AND direction = 'outbound' AND status != 'failed' AND created_at >= ?")
+      .prepare("SELECT COUNT(*) AS n FROM communications WHERE channel = ? AND direction = 'OUTBOUND' AND status != 'FAILED' AND created_at >= ?")
       .get(channel, sinceIso) as Row;
     return Number(r.n);
   }

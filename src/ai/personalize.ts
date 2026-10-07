@@ -72,10 +72,3 @@ export class ClaudePersonalizer implements Personalizer {
     });
   }
 }
-
-/** Keyword check so inbound STOP/UNSUBSCRIBE is honoured instantly, even when the AI is unavailable. */
-export function isOptOut(text: string): boolean {
-  const t = text.trim().toLowerCase();
-  if (/^(stop|stopall|unsubscribe|cancel|end|quit|optout|opt out|revoke)\b/.test(t)) return true;
-  return /\b(unsubscribe|remove me|take me off|do not contact|don't contact|stop (emailing|texting|messaging))\b/.test(t);
-}

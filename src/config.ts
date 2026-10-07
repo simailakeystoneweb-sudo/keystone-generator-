@@ -43,6 +43,8 @@ export interface Config {
   trustProxy: boolean;
   /** Max AI requests per client per minute (0 = unlimited). */
   aiRateLimitPerMinute: number;
+  /** Max email/SMS send requests per client per minute (0 = unlimited). */
+  sendRateLimitPerMinute: number;
 
   googlePlacesApiKey: string;
   hunterApiKey: string;
@@ -60,6 +62,11 @@ export interface Config {
   };
 
   emailProvider: EmailProvider;
+  /** OUTREACH_FROM_EMAIL — the address outreach is sent from (must be on a domain verified in Resend). */
+  outreachFromEmail: string;
+  /** OUTREACH_FROM_NAME — display name, default "Keystone Web Agency". */
+  outreachFromName: string;
+  /** Formatted From header derived from the two above (or legacy EMAIL_FROM). */
   emailFrom: string;
   emailReplyTo: string;
   resendApiKey: string;
@@ -69,9 +76,13 @@ export interface Config {
 
   twilioAccountSid: string;
   twilioAuthToken: string;
-  twilioFromNumber: string;
+  /** TWILIO_PHONE_NUMBER (E.164). Legacy TWILIO_FROM_NUMBER is still read as a fallback. */
+  twilioPhoneNumber: string;
   twilioMessagingServiceSid: string;
   twilioValidateSignature: boolean;
+  /** Never send SMS between these local hours (TCPA quiet hours: before 8am / after 9pm). */
+  smsQuietHoursStart: number;
+  smsQuietHoursEnd: number;
 
   rules: RulesConfig;
 }
@@ -107,6 +118,7 @@ export function loadConfig(): Config {
     appSecret: str("APP_SECRET", "change-me"),
     trustProxy: bool("TRUST_PROXY", false),
     aiRateLimitPerMinute: num("AI_RATE_LIMIT_PER_MINUTE", 20),
+    sendRateLimitPerMinute: num("SEND_RATE_LIMIT_PER_MINUTE", 10),
     dryRun: bool("DRY_RUN", true),
 
     googlePlacesApiKey: str("GOOGLE_PLACES_API_KEY"),
@@ -128,7 +140,9 @@ export function loadConfig(): Config {
     },
 
     emailProvider: (str("EMAIL_PROVIDER", "resend") as EmailProvider),
-    emailFrom: str("EMAIL_FROM"),
+    outreachFromEmail: str("OUTREACH_FROM_EMAIL"),
+    outreachFromName: str("OUTREACH_FROM_NAME", "Keystone Web Agency"),
+    emailFrom: formatFrom(str("OUTREACH_FROM_NAME", "Keystone Web Agency"), str("OUTREACH_FROM_EMAIL")) || str("EMAIL_FROM"),
     emailReplyTo: str("EMAIL_REPLY_TO"),
     resendApiKey: str("RESEND_API_KEY"),
     resendWebhookSecret: str("RESEND_WEBHOOK_SECRET"),
@@ -137,9 +151,11 @@ export function loadConfig(): Config {
 
     twilioAccountSid: str("TWILIO_ACCOUNT_SID"),
     twilioAuthToken: str("TWILIO_AUTH_TOKEN"),
-    twilioFromNumber: str("TWILIO_FROM_NUMBER"),
+    twilioPhoneNumber: str("TWILIO_PHONE_NUMBER") || str("TWILIO_FROM_NUMBER"),
     twilioMessagingServiceSid: str("TWILIO_MESSAGING_SERVICE_SID"),
     twilioValidateSignature: bool("TWILIO_VALIDATE_SIGNATURE", true),
+    smsQuietHoursStart: num("SMS_QUIET_HOURS_START", 21),
+    smsQuietHoursEnd: num("SMS_QUIET_HOURS_END", 8),
 
     rules: {
       approvalMode: str("APPROVAL_MODE", "manual") === "auto" ? "auto" : "manual",
@@ -157,4 +173,16 @@ export function loadConfig(): Config {
       blockedIndustries: str("BLOCKED_INDUSTRIES").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
     },
   };
+}
+
+/**
+ * Build a From header: `"Keystone Web Agency" <hello@example.com>`. The display name is
+ * stripped of characters that could break or inject into the header.
+ */
+export function formatFrom(name: string, email: string): string {
+  const addr = email.trim();
+  if (!addr) return "";
+  if (!/^[^\s@<>"]+@[^\s@<>"]+\.[^\s@<>"]+$/.test(addr)) throw new Error(`OUTREACH_FROM_EMAIL is not a valid email address: ${addr}`);
+  const display = name.replace(/[\r\n"<>\\]/g, "").trim();
+  return display ? `"${display}" <${addr}>` : addr;
 }
