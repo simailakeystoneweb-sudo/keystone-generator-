@@ -1,0 +1,34 @@
+{
+  "name": "keystone-generator",
+  "version": "0.1.0",
+  "description": "Lead generation → AI personalization → approval rules → email/SMS outreach → CRM pipeline",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5"
+  },
+  "bin": {
+    "keystone": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/web/dashboard.html','dist/web/dashboard.html')\"",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "node --no-warnings=ExperimentalWarning --import tsx src/cli.ts",
+    "serve": "node --no-warnings=ExperimentalWarning --import tsx src/cli.ts serve",
+    "test": "node --no-warnings=ExperimentalWarning --import tsx --test test/*.test.ts",
+    "start": "node --no-warnings=ExperimentalWarning dist/cli.js serve"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "express": "^5.2.1",
+    "nodemailer": "^10.0.15",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.20.5",
+    "@types/nodemailer": "^8.0.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
