@@ -3,6 +3,7 @@ import type {
   Channel,
   Draft,
   Lead,
+  LeadAnalysisRecord,
   LeadStatus,
   MessageStatus,
   OutboundMessage,
@@ -103,7 +104,9 @@ function rowToLead(r: Row): Lead {
     sourceId: (r.source_id as string) ?? null,
     rating: r.rating == null ? null : Number(r.rating),
     reviewCount: r.review_count == null ? null : Number(r.review_count),
+    description: (r.description as string) ?? null,
     audit: r.audit_json ? (JSON.parse(String(r.audit_json)) as WebsiteAudit) : null,
+    analysis: r.analysis_json ? (JSON.parse(String(r.analysis_json)) as LeadAnalysisRecord) : null,
     score: r.score == null ? null : Number(r.score),
     status: r.status as LeadStatus,
     smsConsent: Boolean(r.sms_consent),
@@ -179,6 +182,15 @@ export class CRM {
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /** Additive column migrations for databases created by older versions. */
+  private migrate(): void {
+    const cols = new Set((this.db.prepare("PRAGMA table_info(leads)").all() as Row[]).map((r) => String(r.name)));
+    for (const [name, type] of [["description", "TEXT"], ["analysis_json", "TEXT"]] as const) {
+      if (!cols.has(name)) this.db.exec(`ALTER TABLE leads ADD COLUMN ${name} ${type}`);
+    }
   }
 
   close(): void {
@@ -261,7 +273,9 @@ export class CRM {
 
   updateLead(
     id: number,
-    patch: Partial<Pick<Lead, "contactName" | "email" | "phone" | "website" | "industry" | "city" | "audit" | "score" | "smsConsent" | "notes">>,
+    patch: Partial<
+      Pick<Lead, "contactName" | "email" | "phone" | "website" | "industry" | "city" | "description" | "audit" | "analysis" | "score" | "smsConsent" | "notes">
+    >,
   ): Lead {
     const cols: string[] = [];
     const vals: (string | number | null)[] = [];
@@ -272,13 +286,14 @@ export class CRM {
       website: "website",
       industry: "industry",
       city: "city",
+      description: "description",
       score: "score",
       notes: "notes",
     };
     for (const [k, v] of Object.entries(patch)) {
       if (v === undefined) continue;
-      if (k === "audit") {
-        cols.push("audit_json = ?");
+      if (k === "audit" || k === "analysis") {
+        cols.push(`${k}_json = ?`);
         vals.push(v == null ? null : JSON.stringify(v));
       } else if (k === "smsConsent") {
         cols.push("sms_consent = ?");

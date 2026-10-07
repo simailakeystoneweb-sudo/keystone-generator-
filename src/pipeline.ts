@@ -4,7 +4,8 @@ import { CRM } from "./crm/db.js";
 import { auditWebsite, scoreLead } from "./leads/audit.js";
 import { findContact } from "./leads/enrich.js";
 import { searchGooglePlaces, type Fetch, type ImportedRow, type SearchQuery } from "./leads/finder.js";
-import { quickIntent, type Personalizer, type ReplyClassification } from "./ai/personalize.js";
+import { isOptOut, leadToInput, type Personalizer, type ReplyClassification } from "./ai/personalize.js";
+import type { AnalyzeLeadInput, ClaudeService, ColdEmail, ColdSms, FollowUp } from "./ai/claude.js";
 import { composeEmail, type EmailSender } from "./channels/email.js";
 import { composeSms, type SmsSender } from "./channels/sms.js";
 import { decideApproval, sendBlocker, startOfLocalDayIso } from "./rules.js";
@@ -15,6 +16,8 @@ export interface PipelineDeps {
   cfg: Config;
   crm: CRM;
   personalizer: Personalizer | null;
+  /** Server-side Claude service behind the Lead Details AI buttons. */
+  claude?: ClaudeService | null;
   email: EmailSender | null;
   sms: SmsSender | null;
   fetchImpl?: Fetch;
@@ -101,12 +104,7 @@ export class Pipeline {
     }
 
     const out = await this.deps.personalizer.draft(lead);
-    const draft = this.crm.saveDraft(leadId, {
-      emailSubject: out.email_subject,
-      emailBody: out.email_body,
-      smsBody: out.sms_body,
-      reasoning: out.reasoning,
-    });
+    const draft = this.crm.saveDraft(leadId, out);
     this.crm.setStatus(leadId, "drafted");
     lead = this.mustLead(leadId);
 
@@ -247,12 +245,18 @@ export class Pipeline {
   }
 
   /** An inbound reply (email or SMS). Classifies intent and advances the pipeline. */
-  async handleInbound(channel: Channel, from: string, text: string, provider: string, providerId: string | null = null): Promise<{ lead: Lead | null; intent: ReplyClassification["intent"] | null }> {
+  async handleInbound(
+    channel: Channel,
+    from: string,
+    text: string,
+    provider: string,
+    providerId: string | null = null,
+  ): Promise<{ lead: Lead | null; intent: ReplyClassification["classification"] | null; classification?: ReplyClassification }> {
     const address = channel === "email" ? extractAddress(from) : from;
     const lead = channel === "email" ? this.crm.findLeadByEmail(address) : this.crm.findLeadByPhone(address);
     if (!lead) {
       // Still honour STOP from unknown numbers/addresses.
-      if (quickIntent(text) === "unsubscribe") this.crm.suppress(address, `${channel} opt-out from unknown sender`);
+      if (isOptOut(text)) this.crm.suppress(address, `${channel} opt-out from unknown sender`);
       return { lead: null, intent: null };
     }
     this.crm.recordMessage({
@@ -261,42 +265,53 @@ export class Pipeline {
     });
 
     let cls: ReplyClassification;
-    const quick = quickIntent(text);
-    if (quick) cls = { intent: quick, summary: "Opt-out keyword", suggested_response: "" };
-    else if (this.deps.personalizer) {
+    if (isOptOut(text)) {
+      cls = { classification: "UNSUBSCRIBE", sentiment: "NEGATIVE", recommendedAction: "Opt-out keyword: do not contact again.", shouldPauseSequence: true };
+    } else if (this.deps.personalizer) {
       try {
         cls = await this.deps.personalizer.classifyReply(lead, text, channel);
       } catch (err) {
-        cls = { intent: "other", summary: `classification failed: ${err instanceof Error ? err.message : err}`, suggested_response: "" };
+        cls = {
+          classification: "OTHER",
+          sentiment: "NEUTRAL",
+          recommendedAction: `Read and reply manually (classification failed: ${err instanceof Error ? err.message : err})`,
+          shouldPauseSequence: true,
+        };
       }
-    } else cls = { intent: "other", summary: "No AI configured", suggested_response: "" };
-
-    this.crm.logEvent(lead.id, `${channel}.reply`, `${cls.intent}: ${cls.summary}`);
-    if (cls.suggested_response) this.crm.logEvent(lead.id, "reply.suggestion", cls.suggested_response);
-
-    switch (cls.intent) {
-      case "unsubscribe":
-        this.crm.optOut(lead.id, `${channel} reply: ${text.slice(0, 80)}`);
-        break;
-      case "not_interested":
-        this.crm.setStatus(lead.id, "replied");
-        this.crm.setStatus(lead.id, "lost", cls.summary);
-        break;
-      case "booked":
-        this.crm.setStatus(lead.id, "replied");
-        this.crm.setStatus(lead.id, "interested");
-        this.crm.setStatus(lead.id, "booked", cls.summary);
-        break;
-      case "interested":
-        this.crm.setStatus(lead.id, "replied");
-        this.crm.setStatus(lead.id, "interested", cls.summary);
-        break;
-      case "out_of_office":
-        break; // not a real reply; keep follow-ups going
-      default:
-        this.crm.setStatus(lead.id, "replied", cls.summary);
+    } else {
+      cls = { classification: "OTHER", sentiment: "NEUTRAL", recommendedAction: "Read and reply manually.", shouldPauseSequence: true };
     }
-    return { lead: this.mustLead(lead.id), intent: cls.intent };
+    this.applyClassification(lead.id, channel, cls, text);
+    return { lead: this.mustLead(lead.id), intent: cls.classification, classification: cls };
+  }
+
+  /** Move the lead through the CRM according to a reply classification. */
+  applyClassification(leadId: number, channel: Channel, cls: ReplyClassification, text = ""): void {
+    this.crm.logEvent(leadId, `${channel}.reply`, `${cls.classification} (${cls.sentiment}): ${cls.recommendedAction}`);
+    switch (cls.classification) {
+      case "UNSUBSCRIBE":
+        this.crm.optOut(leadId, `${channel} reply: ${text.slice(0, 80)}`);
+        break;
+      case "NOT_INTERESTED":
+        this.crm.setStatus(leadId, "replied");
+        this.crm.setStatus(leadId, "lost", cls.recommendedAction);
+        break;
+      case "MEETING_BOOKED":
+        this.crm.setStatus(leadId, "replied");
+        this.crm.setStatus(leadId, "interested");
+        this.crm.setStatus(leadId, "booked", cls.recommendedAction);
+        break;
+      case "INTERESTED":
+        this.crm.setStatus(leadId, "replied");
+        this.crm.setStatus(leadId, "interested", cls.recommendedAction);
+        break;
+      case "OUT_OF_OFFICE":
+        if (!cls.shouldPauseSequence) break; // auto-reply: keep the sequence going
+        this.crm.setStatus(leadId, "replied", cls.recommendedAction);
+        break;
+      default: // QUESTION, WRONG_PERSON, OTHER: a human needs to look
+        this.crm.setStatus(leadId, "replied", cls.recommendedAction);
+    }
   }
 
   /** Manual pipeline moves from the dashboard (e.g. booked → closed, or lost). */
@@ -305,6 +320,97 @@ export class Pipeline {
     if (stage === "opted_out") this.crm.optOut(leadId, note ?? "manual");
     else this.crm.setStatus(leadId, stage, note ?? `manual: ${lead.status} → ${stage}`, { force: true });
     return this.mustLead(leadId);
+  }
+
+  // ---------- Lead Details AI actions (generate + save for review; never send) ----------
+
+  private requireClaude(): ClaudeService {
+    if (!this.deps.claude) throw new Error("Claude is not configured: set ANTHROPIC_API_KEY on the server.");
+    return this.deps.claude;
+  }
+
+  /** Run Claude's lead analysis, store it on the lead, and use its score as the lead's fit score. */
+  async analyzeLead(leadId: number, overrides: Partial<Pick<AnalyzeLeadInput, "description" | "notes" | "knownWebsiteIssues">> = {}) {
+    const lead = this.mustLead(leadId);
+    if (overrides.description !== undefined || overrides.notes !== undefined) {
+      this.crm.updateLead(leadId, { description: overrides.description, notes: overrides.notes });
+    }
+    const analysis = await this.requireClaude().analyzeLead(leadToInput(this.mustLead(leadId), overrides));
+    this.crm.updateLead(leadId, { analysis: { ...analysis, analyzedAt: this.now().toISOString() }, score: analysis.leadScore });
+    this.crm.logEvent(leadId, "ai.analyzed", `${analysis.quality} · lead ${analysis.leadScore} · website ${analysis.websiteScore} · ${analysis.recommendedChannel}`);
+    if (lead.status === "new") this.crm.setStatus(leadId, "enriched", "analyzed by Claude");
+    return analysis;
+  }
+
+  async generateEmail(leadId: number): Promise<ColdEmail> {
+    const lead = this.mustLead(leadId);
+    const email = await this.requireClaude().generateColdEmail({ lead: leadToInput(lead), analysis: lead.analysis ?? undefined });
+    this.saveGenerated(leadId, { emailSubject: email.subject, emailBody: email.body }, "ai.email_generated");
+    return email;
+  }
+
+  async generateSms(leadId: number): Promise<ColdSms> {
+    const lead = this.mustLead(leadId);
+    const sms = await this.requireClaude().generateColdSMS({ lead: leadToInput(lead), analysis: lead.analysis ?? undefined });
+    this.saveGenerated(leadId, { smsBody: sms.message }, "ai.sms_generated");
+    return sms;
+  }
+
+  /** Draft a follow-up from the lead's message history. Returned for review only — not saved as the outreach draft, not sent. */
+  async generateFollowUp(leadId: number, channel: "EMAIL" | "SMS"): Promise<FollowUp> {
+    const lead = this.mustLead(leadId);
+    const history = this.crm.messagesForLead(leadId).filter((m) => m.status !== "failed" && m.body);
+    const outbound = history.filter((m) => m.direction === "outbound");
+    const last = history.at(-1);
+    const result = await this.requireClaude().generateFollowUp({
+      lead: leadToInput(lead),
+      analysis: lead.analysis ?? undefined,
+      channel,
+      followUpNumber: Math.max(1, outbound.length),
+      previousMessages: history.slice(-10).map((m) => ({
+        channel: m.channel === "email" ? "EMAIL" : "SMS",
+        direction: m.direction === "outbound" ? "OUTBOUND" : "INBOUND",
+        subject: m.subject ?? "",
+        body: m.body.slice(0, 6000),
+        sentAt: m.createdAt,
+      })),
+      daysSinceLastMessage: last ? Math.floor((this.now().getTime() - new Date(last.createdAt).getTime()) / 86_400_000) : undefined,
+    });
+    this.crm.logEvent(leadId, "ai.follow_up_generated", channel);
+    return result;
+  }
+
+  /** Classify a reply pasted in by a human (e.g. one received outside the webhooks) and update the CRM. */
+  async classifyLeadReply(leadId: number, replyText: string, channel: Channel = "email"): Promise<ReplyClassification> {
+    const lead = this.mustLead(leadId);
+    const cls = isOptOut(replyText)
+      ? { classification: "UNSUBSCRIBE" as const, sentiment: "NEGATIVE" as const, recommendedAction: "Opt-out keyword: do not contact again.", shouldPauseSequence: true }
+      : await this.requireClaude().classifyReply({ replyText, channel: channel === "email" ? "EMAIL" : "SMS", businessName: lead.businessName });
+    this.crm.recordMessage({
+      leadId, draftId: null, channel, direction: "inbound", provider: "manual", providerId: null,
+      to: null, subject: null, body: replyText, status: "received", error: null,
+    });
+    this.applyClassification(leadId, channel, cls, replyText);
+    return cls;
+  }
+
+  /**
+   * Store generated copy as a NEW, unapproved draft (carrying over the other channel's text),
+   * so it can be reviewed and edited. Because sending requires the latest draft to be
+   * approved, generating new copy also holds any send that was previously approved.
+   */
+  private saveGenerated(leadId: number, patch: { emailSubject?: string; emailBody?: string; smsBody?: string }, event: string): void {
+    const lead = this.mustLead(leadId);
+    const prev = this.crm.latestDraft(leadId);
+    const draft = this.crm.saveDraft(leadId, {
+      emailSubject: patch.emailSubject ?? prev?.emailSubject ?? "",
+      emailBody: patch.emailBody ?? prev?.emailBody ?? "",
+      smsBody: patch.smsBody ?? prev?.smsBody ?? "",
+      reasoning: lead.analysis?.reasonForContacting ?? prev?.reasoning ?? "",
+    });
+    this.crm.logEvent(leadId, event, `saved as unapproved draft ${draft.id}`);
+    if (["new", "enriched"].includes(lead.status)) this.crm.setStatus(leadId, "drafted");
+    else if (lead.status === "approved") this.crm.setStatus(leadId, "pending_approval", "new AI copy needs review", { force: true });
   }
 
   // ---------- unsubscribe links ----------

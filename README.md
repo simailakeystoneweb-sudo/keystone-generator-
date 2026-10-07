@@ -65,6 +65,48 @@ Requires Node 22.5+ (uses the built-in `node:sqlite`).
 | CRM | `src/crm/db.ts`, `src/pipeline.ts` | SQLite: leads, drafts, messages, a per-lead event timeline, and a suppression list. Stages only move forward, so a late "delivered" webhook can't undo "replied". |
 | Reply handling | `src/pipeline.ts` | Inbound replies are matched to a lead. STOP/unsubscribe keywords are honoured immediately; everything else is classified by Claude as interested, booked, not interested, question, or out of office, and the lead's stage moves with it. Claude's suggested response is saved to the timeline. |
 
+## Claude service
+
+All Claude calls go through `src/ai/claude.ts` (`ClaudeService`), which runs **only on the server**. It reads `ANTHROPIC_API_KEY` from the environment. The browser never sees the key and never calls Anthropic: the dashboard posts to this server's `/api/ai/*` routes, and they return only the generated JSON.
+
+| Function | Returns |
+|---|---|
+| `analyzeLead({ businessName, website, industry, city, description, knownWebsiteIssues, notes })` | `{ leadScore, websiteScore, quality: LOW\|MEDIUM\|HIGH, summary, painPoints[], recommendedOffer, recommendedChannel: EMAIL\|SMS\|BOTH, reasonForContacting }` |
+| `generateColdEmail({ lead, analysis? })` | `{ subject, body }`, written as Keystone Web Agency (professional, friendly, confident, short, personalized, not spammy) |
+| `generateColdSMS({ lead, analysis? })` | `{ message }` (casual, professional, human, short) |
+| `generateFollowUp({ lead, analysis?, channel: EMAIL\|SMS, followUpNumber?, previousMessages?, daysSinceLastMessage? })` | `{ channel: "EMAIL", subject, body }` or `{ channel: "SMS", message }` |
+| `classifyReply({ replyText, channel?, businessName?, originalMessage? })` | `{ classification, sentiment, recommendedAction, shouldPauseSequence }` |
+
+Reply classifications are `INTERESTED`, `MEETING_BOOKED`, `QUESTION`, `NOT_INTERESTED`, `UNSUBSCRIBE`, `WRONG_PERSON`, `OUT_OF_OFFICE` and `OTHER`. Sentiment is `POSITIVE`, `NEUTRAL` or `NEGATIVE`. `shouldPauseSequence` is always true for a real human reply; only out-of-office auto-replies keep the sequence running.
+
+Every request uses `claude-opus-5-5` (override with `ANTHROPIC_MODEL`) with adaptive thinking, structured JSON output validated with Zod, and the server-side refusal fallback. Scraped and user-supplied text is marked as untrusted in the prompts.
+
+### Endpoints
+
+All are `POST`, require `Authorization: Bearer $DASHBOARD_TOKEN`, are rate limited (`AI_RATE_LIMIT_PER_MINUTE`), and **never send email or SMS**. If `DASHBOARD_TOKEN` isn't set, the AI routes only accept requests from localhost.
+
+| Endpoint | Body | Saves |
+|---|---|---|
+| `/api/ai/analyze-lead` | `analyzeLead` input | nothing (stateless) |
+| `/api/ai/generate-cold-email` | `{ lead, analysis? }` | nothing |
+| `/api/ai/generate-cold-sms` | `{ lead, analysis? }` | nothing |
+| `/api/ai/generate-follow-up` | `generateFollowUp` input | nothing |
+| `/api/ai/classify-reply` | `classifyReply` input | nothing |
+| `/api/ai/leads/:id/analyze` | `{ description?, notes?, knownWebsiteIssues? }` | analysis + score on the lead |
+| `/api/ai/leads/:id/email` | — | a new **unapproved** draft |
+| `/api/ai/leads/:id/sms` | — | a new **unapproved** draft |
+| `/api/ai/leads/:id/follow-up` | `{ channel }` | nothing (returned for review) |
+| `/api/ai/leads/:id/classify-reply` | `{ replyText, channel? }` | the reply + CRM stage |
+| `GET /api/ai/status` | — | — (reports whether Claude is configured) |
+
+Errors come back as `400` (invalid input, with the issues listed), `404` (unknown lead), `429` (rate limited), `502` (Claude failed or declined) or `503` (`ANTHROPIC_API_KEY` not set). Provider error details are logged on the server, not returned to the browser.
+
+Generated copy is saved as a new unapproved draft, and sending requires the latest draft to be approved. So generating new copy also holds anything that was approved earlier, until a person approves it again.
+
+### Lead Details page
+
+`/leads/:id` (click any lead on the dashboard) shows the lead, its website audit and editable context (description, known issues, notes), plus **Analyze Lead**, **Generate Email** and **Generate SMS** buttons. Each button shows a spinner and a busy label while it runs. The page also has follow-up generation, reply classification, an editable email/SMS draft with word and SMS-segment counters, and the message timeline. Nothing on this page sends anything.
+
 ## Webhooks
 
 Set `PUBLIC_BASE_URL` to the server's public URL, then point the providers at:

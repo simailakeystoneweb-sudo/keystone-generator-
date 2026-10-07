@@ -11,7 +11,7 @@
     "keystone": "dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node -e \"require('fs').copyFileSync('src/web/dashboard.html','dist/web/dashboard.html')\"",
+    "build": "tsc -p tsconfig.json && node -e \"for (const f of ['dashboard.html','lead.html']) require('fs').copyFileSync('src/web/'+f,'dist/web/'+f)\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "node --no-warnings=ExperimentalWarning --import tsx src/cli.ts",
     "serve": "node --no-warnings=ExperimentalWarning --import tsx src/cli.ts serve",

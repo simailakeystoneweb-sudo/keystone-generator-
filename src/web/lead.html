@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lead Details · Keystone</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#667085; --line:#e4e7ec; --accent:#2f6fed; --ok:#12805c; --warn:#b54708; --bad:#b42318; --soft:#eef3ff; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#171a21; --ink:#e6e8eb; --muted:#98a2b3; --line:#2a2f3a; --accent:#6c9cff; --ok:#3ccb8f; --warn:#f5a524; --bad:#f97066; --soft:#1c2333; } }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  a { color:var(--accent); }
+  header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:14px 16px; border-bottom:1px solid var(--line); background:var(--card); }
+  h1 { font-size:20px; margin:0; } h2 { font-size:15px; margin:0 0 10px; } h3 { font-size:13px; margin:12px 0 4px; color:var(--muted); font-weight:600; }
+  main { padding:16px; max-width:1180px; margin:0 auto; display:grid; gap:16px; grid-template-columns: minmax(0,1fr) minmax(0,1.35fr); align-items:start; }
+  @media (max-width:900px) { main { grid-template-columns:1fr; } }
+  .col { display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; min-width:0; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .pill.HIGH { color:var(--ok); border-color:var(--ok); } .pill.MEDIUM { color:var(--warn); border-color:var(--warn); } .pill.LOW { color:var(--bad); border-color:var(--bad); }
+  .muted { color:var(--muted); } .small { font-size:12px; }
+  dl { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:4px 12px; margin:0; } dt { color:var(--muted); } dd { margin:0; overflow-wrap:anywhere; }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  input, textarea, select { width:100%; font:inherit; color:inherit; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; }
+  textarea { resize:vertical; min-height:70px; }
+  button { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:6px; padding:7px 12px; cursor:pointer; display:inline-flex; align-items:center; gap:6px; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.6; cursor:not-allowed; }
+  .actions { display:flex; flex-wrap:wrap; gap:8px; }
+  .ai-bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .spinner { width:14px; height:14px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:spin .8s linear infinite; display:none; }
+  button.loading .spinner { display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .notice { background:var(--soft); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:13px; }
+  .error { color:var(--bad); font-size:13px; margin-top:8px; }
+  .scores { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px; }
+  .score { border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
+  .score b { font-size:22px; } .bar { height:6px; border-radius:3px; background:var(--line); margin-top:6px; overflow:hidden; } .bar i { display:block; height:100%; background:var(--accent); }
+  ul { margin:4px 0; padding-left:18px; }
+  ul.findings li.problem::marker { color:var(--bad); } ul.findings li.opportunity::marker { color:var(--ok); }
+  .skeleton { display:grid; gap:8px; } .skeleton div { height:12px; border-radius:4px; background:linear-gradient(90deg,var(--line),var(--bg),var(--line)); background-size:200% 100%; animation:shimmer 1.2s infinite; }
+  @keyframes shimmer { to { background-position:-200% 0; } }
+  .counter { text-align:right; font-size:12px; color:var(--muted); margin-top:2px; }
+  .counter.over { color:var(--bad); }
+  .msg { border-top:1px solid var(--line); padding:8px 0; font-size:13px; } .msg:first-child { border-top:0; }
+  pre { white-space:pre-wrap; margin:0; font:inherit; }
+  .timeline div { font-size:12px; padding:2px 0; }
+  #toast { position:fixed; bottom:16px; right:16px; background:var(--ink); color:var(--bg); padding:8px 12px; border-radius:8px; display:none; max-width:calc(100% - 32px); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <a href="/" class="small">← All leads</a>
+    <h1 id="title">Loading…</h1>
+    <div class="small muted" id="subtitle"></div>
+  </div>
+  <div class="actions"><span id="status" class="pill"></span><span id="aiStatus" class="pill"></span></div>
+</header>
+
+<main>
+  <div class="col">
+    <section class="card">
+      <h2>Lead</h2>
+      <dl id="info"></dl>
+    </section>
+
+    <section class="card">
+      <h2>Website audit</h2>
+      <div id="audit"></div>
+      <h3>Pipeline</h3>
+      <div class="actions">
+        <button data-enrich>Re-run audit</button>
+        <button data-stage="interested">Mark interested</button>
+        <button data-stage="booked">Mark booked</button>
+        <button data-stage="closed">Mark closed</button>
+        <button data-stage="lost">Mark lost</button>
+        <button data-stage="opted_out">Mark opted out</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Context for Claude</h2>
+      <label for="description">Description</label>
+      <textarea id="description" maxlength="4000" placeholder="What the business does, who they serve, anything notable…"></textarea>
+      <label for="issues">Known website issues <span class="muted">(one per line)</span></label>
+      <textarea id="issues" rows="6"></textarea>
+      <label for="notes">Notes</label>
+      <textarea id="notes" maxlength="4000" placeholder="Anything you know: referral, past conversations, budget hints…"></textarea>
+      <p class="small muted">These are sent to Claude when you click <b>Analyze Lead</b>. Description and notes are saved to the lead.</p>
+    </section>
+
+    <section class="card">
+      <h2>Messages</h2>
+      <div id="messages"></div>
+      <h3>Timeline</h3>
+      <div id="timeline" class="timeline"></div>
+    </section>
+  </div>
+
+  <div class="col">
+    <section class="card">
+      <div class="ai-bar">
+        <button class="primary" id="btnAnalyze" data-label="Analyze Lead" data-busy="Analyzing…"><span class="spinner"></span><span>Analyze Lead</span></button>
+        <button id="btnEmail" data-label="Generate Email" data-busy="Writing email…"><span class="spinner"></span><span>Generate Email</span></button>
+        <button id="btnSms" data-label="Generate SMS" data-busy="Writing SMS…"><span class="spinner"></span><span>Generate SMS</span></button>
+      </div>
+      <p class="notice" style="margin:10px 0 0">Nothing is sent from this page. Generated copy is saved as an <b>unapproved draft</b> for you to review and edit.</p>
+      <div id="aiError" class="error" hidden></div>
+    </section>
+
+    <section class="card" id="analysisCard">
+      <h2>Lead analysis <span id="quality" class="pill" hidden></span></h2>
+      <div id="analysis"><p class="muted small">Click <b>Analyze Lead</b> to score this lead and get a recommended pitch.</p></div>
+    </section>
+
+    <section class="card">
+      <h2>Cold email</h2>
+      <div id="emailBox">
+        <label for="emailSubject">Subject</label>
+        <input id="emailSubject">
+        <label for="emailBody">Body</label>
+        <textarea id="emailBody" rows="11"></textarea>
+        <div class="counter" id="emailCount"></div>
+      </div>
+      <div class="actions" style="margin-top:8px">
+        <button data-save="email">Save edits</button>
+        <button data-copy="email">Copy</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Cold SMS</h2>
+      <div id="smsBox">
+        <textarea id="smsBody" rows="4"></textarea>
+        <div class="counter" id="smsCount"></div>
+      </div>
+      <p class="small muted">"Reply STOP to opt out." is added automatically when sent.</p>
+      <div class="actions">
+        <button data-save="sms">Save edits</button>
+        <button data-copy="sms">Copy</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Follow-up</h2>
+      <div class="actions">
+        <select id="fuChannel" style="width:auto"><option value="EMAIL">Email</option><option value="SMS">SMS</option></select>
+        <button id="btnFollowUp" data-label="Generate follow-up" data-busy="Writing follow-up…"><span class="spinner"></span><span>Generate follow-up</span></button>
+      </div>
+      <div id="followUp" style="margin-top:8px"></div>
+    </section>
+
+    <section class="card">
+      <h2>Classify a reply</h2>
+      <textarea id="replyText" placeholder="Paste a reply from this lead…"></textarea>
+      <div class="actions" style="margin-top:8px">
+        <select id="replyChannel" style="width:auto"><option value="email">Email</option><option value="sms">SMS</option></select>
+        <button id="btnClassify" data-label="Classify reply" data-busy="Classifying…"><span class="spinner"></span><span>Classify reply</span></button>
+      </div>
+      <div id="classification" style="margin-top:8px"></div>
+    </section>
+  </div>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const leadId = Number(location.pathname.split("/").filter(Boolean).pop());
+let token = (() => { try { return localStorage.getItem("keystoneToken") || ""; } catch { return ""; } })();
+let lead = null;
+
+// All AI calls go to this server's /api/ai routes. The browser never sees the Anthropic key.
+async function api(path, opts = {}) {
+  const res = await fetch("/api" + path, { ...opts, headers: { "Content-Type": "application/json", ...(token ? { Authorization: "Bearer " + token } : {}) } });
+  if (res.status === 401) {
+    token = prompt("Dashboard token") || "";
+    try { localStorage.setItem("keystoneToken", token); } catch {}
+    if (token) return api(path, opts);
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data.issues ? ": " + data.issues.map((i) => `${i.path} ${i.message}`).join(", ") : "";
+    throw new Error((data.error || res.statusText) + detail);
+  }
+  return data;
+}
+const post = (path, body) => api(path, { method: "POST", body: JSON.stringify(body || {}) });
+function toast(msg) { const t = $("#toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._h); t._h = setTimeout(() => t.style.display = "none", 3000); }
+
+/** Run an async action with the button in a loading state; returns the result or null on error. */
+async function withLoading(btn, fn, opts = {}) {
+  const label = btn.querySelector("span:last-child");
+  btn.disabled = true; btn.classList.add("loading"); btn.setAttribute("aria-busy", "true");
+  label.textContent = btn.dataset.busy;
+  if (opts.target) opts.target.innerHTML = `<div class="skeleton"><div></div><div style="width:80%"></div><div style="width:60%"></div></div>`;
+  $("#aiError").hidden = true;
+  try { return await fn(); }
+  catch (e) {
+    $("#aiError").textContent = e.message; $("#aiError").hidden = false;
+    if (opts.target && opts.restore) opts.restore();
+    return null;
+  } finally {
+    btn.classList.remove("loading"); btn.removeAttribute("aria-busy"); label.textContent = btn.dataset.label;
+    btn.disabled = !aiReady;
+  }
+}
+
+let aiReady = false;
+
+function renderInfo() {
+  const l = lead;
+  document.title = `${l.businessName} · Keystone`;
+  $("#title").textContent = l.businessName;
+  $("#subtitle").textContent = [l.industry, l.city].filter(Boolean).join(" · ");
+  $("#status").textContent = l.status.replace("_", " ");
+  const row = (k, v) => `<dt>${k}</dt><dd>${v || '<span class="muted">—</span>'}</dd>`;
+  $("#info").innerHTML =
+    row("Contact", esc(l.contactName)) + row("Email", esc(l.email)) + row("Phone", esc(l.phone)) +
+    row("Website", l.website ? `<a href="${esc(/^https?:/i.test(l.website) ? l.website : "https://" + l.website)}" target="_blank" rel="noopener noreferrer">${esc(l.website)}</a>` : "") +
+    row("Industry", esc(l.industry)) + row("City", esc(l.city)) + row("Address", esc(l.address)) +
+    row("Rating", l.rating ? `${l.rating} ★ (${l.reviewCount ?? 0})` : "") + row("Fit score", l.score ?? "") +
+    row("SMS consent", l.smsConsent ? "Yes" : "No");
+}
+
+function renderAudit() {
+  const f = lead.audit?.findings || [];
+  $("#audit").innerHTML = f.length
+    ? `<ul class="findings">${f.map((x) => `<li class="${x.kind}">${esc(x.detail)}</li>`).join("")}</ul>`
+    : `<p class="muted small">Not audited yet.</p>`;
+}
+
+function renderAnalysis(a) {
+  if (!a) return;
+  $("#quality").hidden = false; $("#quality").className = "pill " + a.quality; $("#quality").textContent = a.quality;
+  const meter = (label, v) => `<div class="score"><span class="small muted">${label}</span><br><b>${v}</b><span class="muted">/100</span><div class="bar"><i style="width:${Math.max(0, Math.min(100, v))}%"></i></div></div>`;
+  $("#analysis").innerHTML = `
+    <div class="scores">${meter("Lead score", a.leadScore)}${meter("Website score", a.websiteScore)}</div>
+    <p>${esc(a.summary)}</p>
+    <h3>Pain points</h3><ul>${a.painPoints.map((p) => `<li>${esc(p)}</li>`).join("")}</ul>
+    <h3>Recommended offer</h3><p style="margin:0">${esc(a.recommendedOffer)}</p>
+    <h3>Recommended channel</h3><p style="margin:0"><span class="pill">${esc(a.recommendedChannel)}</span></p>
+    <h3>Reason for contacting</h3><p style="margin:0">${esc(a.reasonForContacting)}</p>
+    ${a.analyzedAt ? `<p class="small muted">Analyzed ${esc(new Date(a.analyzedAt).toLocaleString())}</p>` : ""}`;
+}
+
+function renderMessages() {
+  $("#messages").innerHTML = lead.messages.length
+    ? lead.messages.map((m) => `<div class="msg"><span class="pill">${m.direction} ${m.channel}</span> <span class="pill">${esc(m.status)}</span> <span class="small muted">${esc(new Date(m.createdAt).toLocaleString())}</span>
+        ${m.subject ? `<div><b>${esc(m.subject)}</b></div>` : ""}<pre>${esc(m.body.slice(0, 600))}</pre></div>`).join("")
+    : `<p class="muted small">No messages yet.</p>`;
+  $("#timeline").innerHTML = lead.events.slice().reverse().map((e) =>
+    `<div><span class="muted">${esc(new Date(e.createdAt).toLocaleString())}</span> <b>${esc(e.type)}</b> ${esc(e.detail || "")}</div>`).join("");
+}
+
+function counters() {
+  const words = $("#emailBody").value.trim().split(/\s+/).filter(Boolean).length;
+  $("#emailCount").textContent = `${words} words`;
+  const n = ($("#smsBody").value.trim() + " Reply STOP to opt out.").length;
+  $("#smsCount").textContent = `${n} characters with opt-out (${Math.ceil(n / 153)} SMS segment${n > 160 ? "s" : ""})`;
+  $("#smsCount").classList.toggle("over", n > 320);
+}
+
+async function load() {
+  lead = await api("/leads/" + leadId);
+  renderInfo();
+  renderAudit();
+  $("#description").value = lead.description || "";
+  $("#notes").value = lead.notes || "";
+  $("#issues").value = (lead.audit?.findings || []).map((f) => f.detail).join("\n");
+  renderAnalysis(lead.analysis);
+  if (lead.draft) {
+    $("#emailSubject").value = lead.draft.emailSubject; $("#emailBody").value = lead.draft.emailBody; $("#smsBody").value = lead.draft.smsBody;
+  }
+  counters();
+  renderMessages();
+}
+
+async function reloadSide() { lead = await api("/leads/" + leadId); renderInfo(); renderMessages(); }
+
+$("#btnAnalyze").onclick = (e) => withLoading(e.currentTarget, async () => {
+  const a = await post(`/ai/leads/${leadId}/analyze`, {
+    description: $("#description").value,
+    notes: $("#notes").value,
+    knownWebsiteIssues: $("#issues").value.split("\n").map((s) => s.trim()).filter(Boolean),
+  });
+  renderAnalysis({ ...a, analyzedAt: new Date().toISOString() });
+  toast("Analysis complete"); reloadSide();
+}, { target: $("#analysis"), restore: () => lead.analysis ? renderAnalysis(lead.analysis) : ($("#analysis").innerHTML = "") });
+
+$("#btnEmail").onclick = (e) => {
+  return withLoading(e.currentTarget, async () => {
+    $("#emailSubject").disabled = $("#emailBody").disabled = true;
+    try {
+      const r = await post(`/ai/leads/${leadId}/email`);
+      $("#emailSubject").value = r.subject; $("#emailBody").value = r.body; counters();
+      toast("Email drafted — not sent"); reloadSide();
+    } finally { $("#emailSubject").disabled = $("#emailBody").disabled = false; }
+  });
+};
+
+$("#btnSms").onclick = (e) => withLoading(e.currentTarget, async () => {
+  $("#smsBody").disabled = true;
+  try {
+    const r = await post(`/ai/leads/${leadId}/sms`);
+    $("#smsBody").value = r.message; counters();
+    toast("SMS drafted — not sent"); reloadSide();
+  } finally { $("#smsBody").disabled = false; }
+});
+
+$("#btnFollowUp").onclick = (e) => withLoading(e.currentTarget, async () => {
+  const r = await post(`/ai/leads/${leadId}/follow-up`, { channel: $("#fuChannel").value });
+  $("#followUp").innerHTML = r.channel === "EMAIL"
+    ? `<p style="margin:0"><b>${esc(r.subject)}</b></p><pre>${esc(r.body)}</pre>`
+    : `<pre>${esc(r.message)}</pre>`;
+  $("#followUp").insertAdjacentHTML("beforeend", `<p class="small muted">Not saved or sent — copy it if you want to use it.</p>`);
+}, { target: $("#followUp") });
+
+$("#btnClassify").onclick = (e) => {
+  if (!$("#replyText").value.trim()) return toast("Paste a reply first");
+  return withLoading(e.currentTarget, async () => {
+    const c = await post(`/ai/leads/${leadId}/classify-reply`, { replyText: $("#replyText").value, channel: $("#replyChannel").value });
+    $("#classification").innerHTML = `<dl>
+      <dt>Classification</dt><dd><span class="pill">${esc(c.classification)}</span></dd>
+      <dt>Sentiment</dt><dd>${esc(c.sentiment)}</dd>
+      <dt>Next step</dt><dd>${esc(c.recommendedAction)}</dd>
+      <dt>Pause sequence</dt><dd>${c.shouldPauseSequence ? "Yes — follow-ups stopped" : "No"}</dd></dl>`;
+    toast("Reply classified; pipeline updated"); reloadSide();
+  }, { target: $("#classification") });
+};
+
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("button[data-save],button[data-copy],button[data-stage],button[data-enrich]");
+  if (!b) return;
+  if (b.dataset.stage || b.hasAttribute("data-enrich")) {
+    b.disabled = true;
+    try {
+      if (b.dataset.stage) await post(`/leads/${leadId}/stage`, { stage: b.dataset.stage });
+      else { await post(`/leads/${leadId}/enrich`); lead = await api("/leads/" + leadId); renderAudit(); $("#issues").value = (lead.audit?.findings || []).map((f) => f.detail).join("\n"); }
+      await reloadSide(); toast("Updated");
+    } catch (err) { toast("Error: " + err.message); } finally { b.disabled = false; }
+    return;
+  }
+  if (b.dataset.copy) {
+    const txt = b.dataset.copy === "email" ? `Subject: ${$("#emailSubject").value}\n\n${$("#emailBody").value}` : $("#smsBody").value;
+    try { await navigator.clipboard.writeText(txt); toast("Copied"); } catch { toast("Copy failed"); }
+    return;
+  }
+  try {
+    const body = b.dataset.save === "email" ? { emailSubject: $("#emailSubject").value, emailBody: $("#emailBody").value } : { smsBody: $("#smsBody").value };
+    await api(`/leads/${leadId}/draft`, { method: "PUT", body: JSON.stringify(body) });
+    toast("Saved");
+  } catch (err) { toast("Error: " + err.message); }
+});
+$("#emailBody").addEventListener("input", counters);
+$("#smsBody").addEventListener("input", counters);
+
+(async () => {
+  try {
+    const s = await api("/ai/status");
+    aiReady = s.configured;
+    $("#aiStatus").textContent = s.configured ? "Claude ready" : "Claude not configured";
+    if (!s.configured) { $("#aiError").textContent = "Set ANTHROPIC_API_KEY on the server to enable AI."; $("#aiError").hidden = false; }
+  } catch (e) {
+    $("#aiStatus").textContent = "Claude unavailable";
+    $("#aiError").textContent = e.message; $("#aiError").hidden = false;
+  }
+  document.querySelectorAll("#btnAnalyze,#btnEmail,#btnSms,#btnFollowUp,#btnClassify").forEach((b) => b.disabled = !aiReady);
+  try { await load(); } catch (e) { $("#title").textContent = "Lead not found"; $("#subtitle").textContent = e.message; }
+})();
+</script>
+</body>
+</html>

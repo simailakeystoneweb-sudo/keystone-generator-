@@ -1,6 +1,7 @@
 import { loadConfig, type Config } from "../src/config.js";
 import { CRM } from "../src/crm/db.js";
 import type { Personalizer, Outreach, ReplyClassification } from "../src/ai/personalize.js";
+import type { ClaudeService } from "../src/ai/claude.js";
 import { DryRunEmailSender } from "../src/channels/email.js";
 import { DryRunSmsSender } from "../src/channels/sms.js";
 import { Pipeline } from "../src/pipeline.js";
@@ -38,18 +39,18 @@ export function testConfig(over: Partial<Config["rules"]> = {}): Config {
 
 export class FakePersonalizer implements Personalizer {
   drafts = 0;
-  nextIntent: ReplyClassification["intent"] = "interested";
+  nextClass: ReplyClassification["classification"] = "INTERESTED";
   async draft(lead: Lead): Promise<Outreach> {
     this.drafts++;
     return {
-      email_subject: `quick note about ${lead.businessName}'s website`,
-      email_body: `Hi ${lead.contactName ?? "there"},\n\nYour site doesn't load well on phones.\n\nAlex`,
-      sms_body: `Hi, Alex from Keystone Web here — noticed ${lead.businessName}'s site isn't mobile friendly. Open to a quick call?`,
+      emailSubject: `quick note about ${lead.businessName}'s website`,
+      emailBody: `Hi ${lead.contactName ?? "there"},\n\nYour site doesn't load well on phones.\n\nAlex`,
+      smsBody: `Hi, Alex from Keystone Web Agency here — noticed ${lead.businessName}'s site isn't mobile friendly. Open to a quick call?`,
       reasoning: "led with mobile",
     };
   }
   async classifyReply(): Promise<ReplyClassification> {
-    return { intent: this.nextIntent, summary: `fake ${this.nextIntent}`, suggested_response: "" };
+    return { classification: this.nextClass, sentiment: "POSITIVE", recommendedAction: `fake ${this.nextClass}`, shouldPauseSequence: true };
   }
 }
 
@@ -85,11 +86,11 @@ export function fakeFetch(routes: Record<string, { status?: number; body: unknow
   return fn;
 }
 
-export function makePipeline(cfg = testConfig(), fetchImpl?: Fetch, now?: () => Date) {
+export function makePipeline(cfg = testConfig(), fetchImpl?: Fetch, now?: () => Date, claude: ClaudeService | null = null) {
   const crm = new CRM(":memory:");
   const personalizer = new FakePersonalizer();
   const email = new DryRunEmailSender();
   const sms = new DryRunSmsSender();
-  const pipeline = new Pipeline({ cfg, crm, personalizer, email, sms, fetchImpl, now });
+  const pipeline = new Pipeline({ cfg, crm, personalizer, email, sms, fetchImpl, now, claude });
   return { cfg, crm, personalizer, email, sms, pipeline };
 }

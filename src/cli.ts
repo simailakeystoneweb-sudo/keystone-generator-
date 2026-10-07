@@ -2,7 +2,8 @@
 import { parseArgs } from "node:util";
 import { loadConfig, loadDotEnv, type Config } from "./config.js";
 import { CRM } from "./crm/db.js";
-import { ClaudePersonalizer } from "./ai/personalize.js";
+import { ClaudePersonalizer, createClaudeService } from "./ai/personalize.js";
+import type { ClaudeService } from "./ai/claude.js";
 import { createEmailSender } from "./channels/email.js";
 import { createSmsSender } from "./channels/sms.js";
 import { importCsv } from "./leads/finder.js";
@@ -29,16 +30,20 @@ Usage: keystone <command> [options]
 
 Set DRY_RUN=false to actually send. See .env.example for configuration.`;
 
-function build(cfg: Config): Pipeline {
+function build(cfg: Config): { pipeline: Pipeline; claude: ClaudeService | null } {
   const crm = new CRM(cfg.dbPath);
-  const hasAnthropicCreds = Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_PROFILE);
-  return new Pipeline({
+  // The Claude client lives only in this server process; the key never leaves it.
+  const svc = createClaudeService(cfg);
+  const claude = svc.configured ? svc : null;
+  const pipeline = new Pipeline({
     cfg,
     crm,
-    personalizer: hasAnthropicCreds || process.env.ANTHROPIC_ENABLE === "true" ? new ClaudePersonalizer(cfg) : null,
+    claude,
+    personalizer: claude ? new ClaudePersonalizer(claude) : null,
     email: createEmailSender(cfg),
     sms: createSmsSender(cfg),
   });
+  return { pipeline, claude };
 }
 
 async function main() {
@@ -64,7 +69,7 @@ async function main() {
   });
   if (!cmd || cmd === "help" || cmd === "--help") return console.log(HELP);
 
-  const p = build(cfg);
+  const { pipeline: p, claude } = build(cfg);
   const id = values.id ? Number(values.id) : undefined;
   const print = (x: unknown) => console.log(typeof x === "string" ? x : JSON.stringify(x, null, 2));
 
@@ -137,9 +142,10 @@ async function main() {
       print(p.crm.stats());
       break;
     case "serve": {
-      const app = createApp(cfg, p);
+      const app = createApp(cfg, p, claude);
       app.listen(cfg.port, () => {
         print(`Dashboard: http://localhost:${cfg.port}  (public: ${cfg.publicBaseUrl})${cfg.dryRun ? "  [DRY RUN]" : ""}`);
+        print(claude ? `Claude: ${cfg.anthropicModel}` : "Claude: not configured (set ANTHROPIC_API_KEY) — AI buttons will be disabled.");
         if (!cfg.dashboardToken) print("Warning: DASHBOARD_TOKEN is not set — the API is unauthenticated. Don't expose this port publicly.");
       });
       const every = Number(values["send-every"] ?? 0);

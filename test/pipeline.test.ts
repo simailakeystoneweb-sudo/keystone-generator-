@@ -68,7 +68,7 @@ test("end to end: find → enrich → draft → auto-approve → send → delive
   assert.equal(r3.sent.length, 0, "never double-sends");
 
   const reply = await pipeline.handleInbound("email", "Joe Smith <JOE@joesplumbing.com>", "Sure, tell me more", "resend");
-  assert.equal(reply.intent, "interested");
+  assert.equal(reply.intent, "INTERESTED");
   assert.equal(crm.getLead(joeId)!.status, "interested");
 
   // late delivery webhook must not regress the stage
@@ -110,7 +110,7 @@ test("STOP reply opts the lead out and suppresses future sends", async () => {
   await pipeline.draft(id);
   await pipeline.sendDue();
   const r = await pipeline.handleInbound("sms", "+1 (512) 555-0100", "STOP", "twilio");
-  assert.equal(r.intent, "unsubscribe");
+  assert.equal(r.intent, "UNSUBSCRIBE");
   const lead = crm.getLead(id)!;
   assert.equal(lead.status, "opted_out");
   assert.ok(crm.isSuppressed("joe@joesplumbing.com"));

@@ -39,6 +39,10 @@ export interface Config {
   /** Signs unsubscribe links. */
   appSecret: string;
   dryRun: boolean;
+  /** Set when running behind a reverse proxy so req.ip is the real client. */
+  trustProxy: boolean;
+  /** Max AI requests per client per minute (0 = unlimited). */
+  aiRateLimitPerMinute: number;
 
   googlePlacesApiKey: string;
   hunterApiKey: string;
@@ -101,6 +105,8 @@ export function loadConfig(): Config {
     port: num("PORT", 3000),
     dashboardToken: str("DASHBOARD_TOKEN"),
     appSecret: str("APP_SECRET", "change-me"),
+    trustProxy: bool("TRUST_PROXY", false),
+    aiRateLimitPerMinute: num("AI_RATE_LIMIT_PER_MINUTE", 20),
     dryRun: bool("DRY_RUN", true),
 
     googlePlacesApiKey: str("GOOGLE_PLACES_API_KEY"),
@@ -111,7 +117,7 @@ export function loadConfig(): Config {
 
     sender: {
       name: str("SENDER_NAME", "Alex"),
-      company: str("SENDER_COMPANY", "Keystone Web"),
+      company: str("SENDER_COMPANY", "Keystone Web Agency"),
       title: str("SENDER_TITLE", "Founder"),
       offer: str(
         "SENDER_OFFER",

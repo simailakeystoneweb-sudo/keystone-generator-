@@ -5,6 +5,8 @@ import path from "node:path";
 import { timingSafeEqual } from "node:crypto";
 import type { Config } from "../config.js";
 import type { Pipeline } from "../pipeline.js";
+import type { ClaudeService } from "../ai/claude.js";
+import { createAiRouter } from "./aiRoutes.js";
 import { verifyResendWebhook } from "../channels/email.js";
 import { verifyTwilioSignature } from "../channels/sms.js";
 import type { LeadStatus } from "../types.js";
@@ -18,10 +20,12 @@ function safeEqual(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-export function createApp(cfg: Config, pipeline: Pipeline): express.Express {
+export function createApp(cfg: Config, pipeline: Pipeline, claude: ClaudeService | null = null): express.Express {
   const app = express();
   const crm = pipeline.crm;
-  app.set("trust proxy", true);
+  // Only trust X-Forwarded-* when explicitly behind a proxy; otherwise clients could spoof their IP.
+  app.set("trust proxy", cfg.trustProxy ? 1 : false);
+  app.disable("x-powered-by");
 
   // ---------- webhooks (provider-authenticated, registered before body parsers that would consume the stream) ----------
 
@@ -125,6 +129,9 @@ export function createApp(cfg: Config, pipeline: Pipeline): express.Express {
   app.get("/", (_req, res) => {
     res.type("html").send(readFileSync(path.join(here, "dashboard.html"), "utf8"));
   });
+  app.get("/leads/:id", (_req, res) => {
+    res.type("html").send(readFileSync(path.join(here, "lead.html"), "utf8"));
+  });
 
   const api = express.Router();
   api.use(express.json({ limit: "256kb" }), requireToken(cfg));
@@ -172,6 +179,20 @@ export function createApp(cfg: Config, pipeline: Pipeline): express.Express {
   }));
   api.post("/run", wrap((req) => pipeline.runAll({ send: req.body?.send !== false })));
   api.post("/send-due", wrap(() => pipeline.sendDue()));
+
+  /** Save hand edits to the latest draft. Does not approve or send it. */
+  api.put("/leads/:id/draft", wrap((req) => {
+    const id = Number(req.params.id);
+    if (!crm.getLead(id)) throw new Error("lead not found");
+    const pick = (k: string) => (typeof req.body?.[k] === "string" ? String(req.body[k]).slice(0, 10000) : undefined);
+    const patch = { emailSubject: pick("emailSubject"), emailBody: pick("emailBody"), smsBody: pick("smsBody") };
+    const draft = crm.latestDraft(id);
+    if (draft) return crm.updateDraft(draft.id, patch);
+    return crm.saveDraft(id, { emailSubject: patch.emailSubject ?? "", emailBody: patch.emailBody ?? "", smsBody: patch.smsBody ?? "", reasoning: "" });
+  }));
+
+  // Claude endpoints (server-side only; behind the same token as the rest of the API).
+  api.use("/ai", createAiRouter(cfg, pipeline, claude));
 
   app.use("/api", api);
   return app;

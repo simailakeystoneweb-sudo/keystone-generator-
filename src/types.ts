@@ -26,6 +26,18 @@ export type LeadStatus = PipelineStage | SideStage;
 export type Channel = "email" | "sms";
 export type MessageStatus = "queued" | "sent" | "delivered" | "failed" | "bounced" | "received";
 
+export interface LeadAnalysisRecord {
+  leadScore: number;
+  websiteScore: number;
+  quality: "LOW" | "MEDIUM" | "HIGH";
+  summary: string;
+  painPoints: string[];
+  recommendedOffer: string;
+  recommendedChannel: "EMAIL" | "SMS" | "BOTH";
+  reasonForContacting: string;
+  analyzedAt?: string;
+}
+
 export interface WebsiteFinding {
   kind: "problem" | "opportunity";
   code: string;
@@ -70,7 +82,11 @@ export interface Lead {
   sourceId: string | null;
   rating: number | null;
   reviewCount: number | null;
+  /** Free-text description of the business (from the user or the source). */
+  description: string | null;
   audit: WebsiteAudit | null;
+  /** Latest Claude lead analysis, if one has been run. */
+  analysis: LeadAnalysisRecord | null;
   score: number | null;
   status: LeadStatus;
   smsConsent: boolean;

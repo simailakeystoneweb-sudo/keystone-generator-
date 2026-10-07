@@ -8,6 +8,7 @@
   :root { --bg:#f6f7f9; --card:#fff; --ink:#1b1f24; --muted:#667085; --line:#e4e7ec; --accent:#2f6fed; --ok:#12805c; --warn:#b54708; --bad:#b42318; }
   @media (prefers-color-scheme: dark) { :root { --bg:#0f1115; --card:#171a21; --ink:#e6e8eb; --muted:#98a2b3; --line:#2a2f3a; --accent:#6c9cff; --ok:#3ccb8f; --warn:#f5a524; --bad:#f97066; } }
   * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
   body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
   header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; justify-content:space-between; padding:16px; border-bottom:1px solid var(--line); background:var(--card); }
   h1 { font-size:18px; margin:0; } h2 { font-size:15px; margin:0 0 10px; }
@@ -32,8 +33,6 @@
   .queue-item { border-top:1px solid var(--line); padding:12px 0; display:grid; gap:8px; } .queue-item:first-of-type { border-top:0; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:12px; } @media (max-width:760px){ .grid2 { grid-template-columns:1fr; } }
   ul.findings { margin:4px 0; padding-left:18px; } ul.findings li.problem::marker { color:var(--bad); } ul.findings li.opportunity::marker { color:var(--ok); }
-  dialog { width:min(820px,100% - 32px); border:1px solid var(--line); border-radius:12px; background:var(--card); color:var(--ink); padding:16px; }
-  dialog::backdrop { background:rgba(0,0,0,.4); }
   .actions { display:flex; flex-wrap:wrap; gap:6px; }
   pre { white-space:pre-wrap; margin:0; font:inherit; }
   #toast { position:fixed; bottom:16px; right:16px; background:var(--ink); color:var(--bg); padding:8px 12px; border-radius:8px; display:none; max-width:calc(100% - 32px); }
@@ -43,7 +42,7 @@
 <header>
   <div><h1>Keystone Outreach</h1><span class="muted small">Find → Enrich → AI draft → Approve → Email/SMS → CRM</span></div>
   <div class="actions"><span id="mode" class="pill"></span><span id="dry" class="pill dry" hidden>DRY RUN</span>
-    <button id="runAll" class="primary">Run pipeline</button><button id="sendDue">Send due</button></div>
+    <button id="runAll" class="primary" title="Enrich and draft new leads. Does not send.">Run pipeline</button><button id="sendDue">Send due</button></div>
 </header>
 <main>
   <section class="card">
@@ -75,7 +74,6 @@
   </section>
 </main>
 
-<dialog id="detail"></dialog>
 <div id="toast"></div>
 
 <script>
@@ -123,7 +121,7 @@ function findingsList(l) {
 function queueItem(l) {
   const d = l.draft || {};
   return `<div class="queue-item" data-id="${l.id}">
-    <div><b>${esc(l.businessName)}</b> <span class="pill">score ${l.score ?? "?"}</span>
+    <div><a href="/leads/${l.id}"><b>${esc(l.businessName)}</b></a> <span class="pill">score ${l.score ?? "?"}</span>
       <span class="muted small">${esc(l.contactName || "")} ${esc(l.email || "")} ${esc(l.phone || "")}</span></div>
     <div class="grid2">
       <div><label class="small muted">Email subject</label><input data-f="emailSubject" value="${esc(d.emailSubject)}" style="width:100%">
@@ -137,35 +135,14 @@ function queueItem(l) {
   </div>`;
 }
 
-async function openDetail(id) {
-  const l = await api("/leads/" + id);
-  const d = l.draft;
-  $("#detail").innerHTML = `
-    <div style="display:flex;justify-content:space-between;gap:8px"><h2>${esc(l.businessName)} <span class="pill">${esc(l.status)}</span></h2><button data-close>Close</button></div>
-    <p class="small">${esc(l.contactName || "Unknown contact")} · ${esc(l.email || "no email")} · ${esc(l.phone || "no phone")}<br>
-      ${l.website ? `<a href="${esc(l.website)}" target="_blank" rel="noopener">${esc(l.website)}</a>` : "No website"} · ${esc(l.industry || "")} · ${esc(l.city || "")} · score ${l.score ?? "?"}</p>
-    <h2>Website problems &amp; opportunities</h2>${findingsList(l)}
-    ${d ? `<h2>Draft</h2><p><b>${esc(d.emailSubject)}</b></p><pre class="small">${esc(d.emailBody)}</pre><p class="small"><b>SMS:</b> ${esc(d.smsBody)}</p>` : ""}
-    <h2>Messages</h2>${l.messages.length ? l.messages.map((m) => `<p class="small"><span class="pill">${m.direction} ${m.channel}</span> <span class="pill">${esc(m.status)}</span> ${esc(m.createdAt)}<br>${esc(m.body.slice(0, 300))}${m.error ? `<br><span style="color:var(--bad)">${esc(m.error)}</span>` : ""}</p>`).join("") : `<p class="muted small">None yet.</p>`}
-    <h2>Timeline</h2>${l.events.map((e) => `<div class="small"><span class="muted">${esc(e.createdAt)}</span> <b>${esc(e.type)}</b> ${esc(e.detail || "")}</div>`).join("")}
-    <h2 style="margin-top:12px">Actions</h2>
-    <div class="actions" data-id="${l.id}">
-      <button data-act="enrich">Re-enrich</button><button data-act="draft">Draft</button><button data-act="send">Send due</button>
-      ${["interested", "booked", "closed", "lost", "opted_out"].map((s) => `<button data-stage="${s}">Mark ${s.replace("_", " ")}</button>`).join("")}
-    </div>`;
-  $("#detail").showModal();
-}
-
 document.addEventListener("click", async (e) => {
   const t = e.target.closest("button,.stage,tr.row");
   if (!t) return;
-  if (t.matches("[data-close]")) return $("#detail").close();
   if (t.matches(".stage")) { filter = filter === t.dataset.stage ? "" : t.dataset.stage; return refresh(); }
-  if (t.matches("tr.row")) return openDetail(t.dataset.id);
+  if (t.matches("tr.row")) return void (location.href = "/leads/" + t.dataset.id);
   const box = t.closest("[data-id]");
   const id = box?.dataset.id;
   const a = t.dataset.act;
-  if (t.dataset.stage && id) { await act(() => post(`/leads/${id}/stage`, { stage: t.dataset.stage }), "Updated"); return openDetail(id); }
   if (!a || !id) return;
   if (a === "approve" || a === "approve-send") {
     const edits = {};
@@ -175,9 +152,6 @@ document.addEventListener("click", async (e) => {
   }
   if (a === "reject") await act(() => post(`/leads/${id}/reject`, { reason: prompt("Reason?") || "rejected" }), "Rejected");
   if (a === "redraft") await act(() => post(`/leads/${id}/redraft`), "New draft ready");
-  if (a === "enrich") { await act(() => post(`/leads/${id}/enrich`), "Enriched"); openDetail(id); }
-  if (a === "draft") { await act(() => post(`/leads/${id}/draft`), (r) => "Decision: " + r.decision.action); openDetail(id); }
-  if (a === "send") { await act(() => post(`/leads/${id}/send`), (r) => `email: ${r.email ?? "sent"} · sms: ${r.sms ?? "sent"}`); openDetail(id); }
 });
 
 $("#findForm").addEventListener("submit", (e) => {
@@ -185,7 +159,8 @@ $("#findForm").addEventListener("submit", (e) => {
   const f = Object.fromEntries(new FormData(e.target));
   act(() => post("/find", f), (r) => `Found ${r.found}, ${r.created} new`);
 });
-$("#runAll").onclick = () => act(() => post("/run"), (r) => "Run: " + JSON.stringify(r));
+// Finds, enriches and drafts only. Sending is always a separate, explicit "Send due" click.
+$("#runAll").onclick = () => act(() => post("/run", { send: false }), (r) => "Run (no sending): " + JSON.stringify(r));
 $("#sendDue").onclick = () => act(() => post("/send-due"), (r) => `Sent ${r.sent.length}, held ${r.held.length}`);
 refresh().catch((e) => toast(e.message));
 setInterval(() => refresh().catch(() => {}), 30000);
